@@ -1,0 +1,22 @@
+# 强制 shell 脚本以 LF 检出，避免 CRLF 导致 VPS 上 bash 报
+# "$'\r': command not found" / "syntax error near unexpected token"
+*.sh text eol=lf
+*.json text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.conf text eol=lf
+*.md text eol=lf
+# 伪装站编辑源与回归证据日志也锁 LF（Windows core.autocrlf 会转换未覆盖的文件）
+*.html text eol=lf
+*.log text eol=lf
+# 仓库配置文件本身同样锁 LF，防止 .githooks/pre-commit 被转成 CRLF 后在 VPS 上不可执行
+.gitattributes text eol=lf
+.gitignore text eol=lf
+.githooks/** text eol=lf
+.workbuddy/** text eol=lf
+
+# 二进制资源不做行尾转换
+*.png binary
+*.jpg binary
+*.gz binary
+*.deb binary

@@ -1,0 +1,31 @@
+# 自检产生的临时产物 —— 全部由 .selftest/*.sh 每次运行时重建，不应入库
+.selftest/bin/
+.selftest/etc/
+.selftest/root/
+.selftest/usr/
+.selftest/var/
+.selftest/state/
+.selftest/state2/
+.selftest/t14/
+.selftest/tmp/
+.selftest/verifybin/
+.selftest/*.log
+.selftest/*.err
+.selftest/*.bak
+.selftest/meminfo
+.selftest/sshd_config
+.selftest/sshd_config.*
+.selftest/.perm_probe
+.selftest/run-copy.sh
+.selftest/probe.sh
+.selftest/probe-run.sh
+.selftest/mod7.sh
+.selftest/test-copy.sh
+# sing-box 桩的凭据轮换计数器（run.sh 每次开头清零，跑完会留下）
+.selftest/gen.counter
+# unit.sh T21 的分域名状态沙箱（正常自删，中途失败会残留）
+.selftest/state-domain*
+# 六层回归的完整证据日志 —— 每次跑 all.sh 重新生成，只留在本地作证据，不入库
+# （证据日志属可再生测试输出，公开仓库保持精简；上面的 *.log 规则已覆盖）
+# 工作区本地笔记（.workbuddy）为内部开发记录，同样不入库
+.workbuddy/
