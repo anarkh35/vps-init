@@ -256,9 +256,11 @@ chk "速率白名单放行"      '0' "$(rc is_rate 1000mbit)"
 # tcpfit 的 shape --rate 用 Mbps 数字，is_rate 两种写法都要放行
 chk "速率白名单放行纯数字(Mbps)" '0' "$(rc is_rate 1000)"
 chk "速率白名单拦截非数字"  '1' "$(rc is_rate abc)"
-# --tcp-bw 必须是正整数：0 会被 tcpfit 当成无效带宽
-chk "tcp-bw 拦截 0"        '1' "$(rc bash -c '[[ 0 =~ ^[0-9]+$ ]] && (( 0 > 0 ))')"
-chk "tcp-bw 放行正整数"     '0' "$(rc bash -c '[[ 1000 =~ ^[0-9]+$ ]] && (( 1000 > 0 ))')"
+# --tcp-bw 必须是正整数：0 会被 tcpfit 当成无效带宽（真校验入口在 validate_settings；
+# 此前两行断言用 bash -c 测正则本身，是恒真伪断言 —— 已改为打真函数，并在 renders 层补 CLI 级场景）
+chk "tcp-bw 拦截 0（validate_settings）"     '1' "$( ( TCP_BW=0; validate_settings ) >/dev/null 2>&1 && echo 0 || echo 1 )"
+chk "tcp-bw 放行正整数（validate_settings）"  '0' "$( ( TCP_BW=1000; validate_settings ) >/dev/null 2>&1 && echo 0 || echo 1 )"
+TCP_BW=""
 chk "REALITY_DEST 放行 IPv6" '0' "$(rc need_host --reality-dest 2001:db8::1)"
 
 echo

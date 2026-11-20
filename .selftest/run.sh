@@ -227,7 +227,8 @@ fi
 # ---- A3：带值写法 --config-mode keep + 交互输入非法后选 1 ----
 echo "======== 二选一 A3：--config-mode keep / 交互非法输入后选 1 ========"
 bash "$T/test-copy.sh" --modules 6,8,9 --config-mode keep > "$T/mode-keep.log" 2>&1
-if [[ "$(snapshot)" == "$snap" ]]; then echo "PASS  --config-mode keep 同样不改动任何文件"; else echo "FAIL  带值写法却改动了文件"; rc=1; fi
+mk_rc=$?
+if [[ $mk_rc -eq 0 && "$(snapshot)" == "$snap" ]]; then echo "PASS  --config-mode keep 不改动任何文件且退出码 0"; else echo "FAIL  带值写法异常（rc=$mk_rc 或文件被改）"; rc=1; fi
 
 printf '3\n1\n' | bash "$T/test-copy.sh" --modules 6,8,9 > "$T/choice-keep.log" 2>&1
 c_rc=$?
@@ -241,10 +242,11 @@ if [[ "$(snapshot)" == "$snap" ]]; then echo "PASS  交互选「沿用旧配置�
 
 # ---- A4：交互输入结束（EOF）也要安全退回 keep ----
 bash "$T/test-copy.sh" --modules 6,8,9 </dev/null > "$T/choice-eof.log" 2>&1
-if grep -q '输入不可用' "$T/choice-eof.log" && [[ "$(snapshot)" == "$snap" ]]; then
-    echo "PASS  交互 EOF 退回「沿用旧配置」且文件不变"
+eof_rc=$?
+if [[ $eof_rc -eq 0 ]] && grep -q '输入不可用' "$T/choice-eof.log" && [[ "$(snapshot)" == "$snap" ]]; then
+    echo "PASS  交互 EOF 退回「沿用旧配置」且文件不变（rc=0）"
 else
-    echo "FAIL  EOF 未安全退回或改动了文件"; rc=1
+    echo "FAIL  EOF 未安全退回或改动了文件（rc=$eof_rc）"; rc=1
 fi
 
 # ---- B1：交互选 2 = 生成新配置，凭据与配置必须全部换新 ----
@@ -302,10 +304,11 @@ if [[ "$(snapshot)" == "$snap_c" ]]; then echo "PASS  所有异常选择均未�
 
 # ---- D：只选模块 8/9 时提示「不轮换凭据」，避免误解 ----
 bash "$T/test-copy.sh" --modules 8,9 --new-config > "$T/new-no6.log" 2>&1
-if grep -q '但未包含模块 6' "$T/new-no6.log"; then
-    echo "PASS  new 模式未含模块 6 时明确提示「只重渲染配置、不轮换凭据」"
+n6_rc=$?
+if [[ $n6_rc -eq 0 ]] && grep -q '但未包含模块 6' "$T/new-no6.log"; then
+    echo "PASS  new 模式未含模块 6 时明确提示「只重渲染配置、不轮换凭据」（rc=0）"
 else
-    echo "FAIL  缺少「未含模块 6」提示"; rc=1
+    echo "FAIL  未含模块 6 场景异常（rc=$n6_rc 或缺提示）"; rc=1
 fi
 
 # ---- 降级重跑：上次是本地回落，本次换域名且无 Token → 必须清掉 127.0.0.1 残留 ----
@@ -371,10 +374,11 @@ else
     echo "FAIL  只读渲染被二选一干扰（rc=$g_rc）"; rc=1
 fi
 bash "$T/test-copy.sh" --yes --modules 7 > "$T/mod7-only.log" 2>&1
-if ! grep -q '请输入 1 或 2' "$T/mod7-only.log"; then
-    echo "PASS  不含模块 6/8 的重跑不弹二选一菜单"
+m7_rc=$?
+if [[ $m7_rc -eq 0 ]] && ! grep -q '请输入 1 或 2' "$T/mod7-only.log"; then
+    echo "PASS  不含模块 6/8 的重跑不弹二选一菜单（rc=0）"
 else
-    echo "FAIL  不含模块 6/8 却弹出了二选一菜单"; rc=1
+    echo "FAIL  重跑菜单行为异常（rc=$m7_rc）"; rc=1
 fi
 
 # ---- H：首次部署时 --uuid 固定值仍生效（不破坏既有参数）----

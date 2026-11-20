@@ -26,7 +26,7 @@ printf 'Port 22\nPasswordAuthentication yes\nPermitRootLogin yes\nPubkeyAuthenti
 # ---- 通用桩 ----
 mk_stub() { printf '#!/usr/bin/env bash\nexit 0\n' > "$T/bin/$1"; chmod +x "$T/bin/$1"; }
 for c in systemctl apt-get apt iptables ip6tables iptables-save ip6tables-save netfilter-persistent \
-         sshd sysctl modprobe ss timedatectl fail2ban-client caddy debconf-set-selections fuser \
+         sysctl modprobe ss timedatectl caddy debconf-set-selections fuser \
          fallocate mkswap swapon gpg chown hostname ip tc qrencode journalctl; do mk_stub "$c"; done
 # fuser 返回 1 表示无进程占用锁（Debian 上未锁时的行为）
 printf '#!/usr/bin/env bash\nexit 1\n' > "$T/bin/fuser"; chmod +x "$T/bin/fuser"
@@ -49,6 +49,30 @@ EOF
 chmod +x "$T/bin/ip"
 printf '#!/usr/bin/env bash\necho testnode\n' > "$T/bin/hostname"; chmod +x "$T/bin/hostname"
 
+# sshd 桩：-t 时真校验配置结构（非注释行必须是「关键字 值」、关键字不得重复）——
+# 恒真桩会把写坏的主配置 / drop-in 放行成全绿。默认读沙箱内配置（cwd=仓库根）。
+cat > "$T/bin/sshd" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "-t" ]]; then
+    conf=".selftest/etc/ssh/sshd_config"
+    [[ -f $conf ]] || conf="/etc/ssh/sshd_config"
+    if [[ -f $conf ]]; then
+        awk '
+            /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
+            !/^[A-Za-z][A-Za-z0-9]*[[:space:]]+/ { print "sshd(stub): 非法行: " $0 > "/dev/stderr"; exit 1 }
+            {
+                if ($1 != "Include" && $1 != "Match" && $1 != "Subsystem" && ($1 in seen)) {
+                    print "sshd(stub): 重复关键字: " $1 > "/dev/stderr"; exit 1
+                }
+                seen[$1]=1
+            }
+        ' "$conf" || exit 1
+    fi
+fi
+exit 0
+EOF
+chmod +x "$T/bin/sshd"
+
 # ---- 带行为差异的桩 ----
 cat > "$T/bin/iptables" <<'EOF'
 #!/usr/bin/env bash
@@ -57,25 +81,54 @@ EOF
 chmod +x "$T/bin/iptables"
 cp "$T/bin/iptables" "$T/bin/ip6tables"
 
+# systemctl 桩（白名单）：单元名拼错（如 singbox / fail2ban 写成别的）时
+# is-active 必须返回失败 —— 恒真桩会把主脚本 healthcheck / 分支判定里的
+# 单元名错误放行成全绿。白名单 = 脚本实际使用的全部真实单元名。
 cat > "$T/bin/systemctl" <<'EOF'
 #!/usr/bin/env bash
-case "$1" in
-    is-active) echo active; exit 0;;
-    is-enabled) exit 0;;          # 让 ssh.socket 分支也被走到
+sub="${1:-}"; shift
+# 单元名 = 第一个非旗标参数（主脚本会传 --quiet 等旗标，不能拿 $2 当单元名）
+u=""
+for a in "$@"; do [[ $a != -* ]] && { u="$a"; break; }; done
+case "$sub" in
+    is-active)
+        case "$u" in
+            ssh|sshd|ssh.socket|sing-box|caddy|fail2ban|systemd-timesyncd.service|systemd-journald|netfilter-persistent) exit 0;;
+            "") exit 0;;   # 无单元名（不应出现）：保持旧行为避免误伤
+            *) exit 1;;
+        esac;;
+    is-enabled)
+        case "$u" in
+            ssh.socket|ssh|sshd|sing-box|caddy|fail2ban|netfilter-persistent) exit 0;;
+            *) exit 1;;
+        esac;;
     list-unit-files) echo "ssh.socket enabled"; exit 0;;
     *) exit 0;;
 esac
 EOF
 chmod +x "$T/bin/systemctl"
 
-# 每次 generate 都返回不同的值，才能验证「重跑必须轮换凭据」而不是碰巧一样。
-# 计数器落在沙箱里，测试开头会清零，保证可复现。
+# sing-box 桩：generate 每次返回不同值；check 子命令真解析 JSON ——
+# 恒真 check 会把主脚本渲染出的非法 JSON 放行成全绿，必须拒绝。
 cat > "$T/bin/sing-box" <<'EOF'
 #!/usr/bin/env bash
 cnt=".selftest/gen.counter"
 n=0
 [[ -f $cnt ]] && n="$(cat "$cnt" 2>/dev/null || echo 0)"
 case "${1:-}${2:-}" in
+    check*)
+        # sing-box check -c <file>：真校验 JSON（无 python 时退化为恒真，与
+        # renders.sh 的 SKIP 约定一致）
+        f=""; prev=""
+        for a in "$@"; do [[ $prev == "-c" ]] && f="$a"; prev="$a"; done
+        if [[ -n $f && -s $f ]]; then
+            PY="$(command -v python3 || command -v python || true)"
+            if [[ -n $PY ]]; then
+                "$PY" -c 'import json,sys; json.load(open(sys.argv[1]))' "$f" >/dev/null 2>&1 \
+                    || { echo "sing-box(stub): 配置不是合法 JSON: $f" >&2; exit 1; }
+            fi
+        fi
+        exit 0;;
     *uuid*) n=$((n+1)); echo "$n" > "$cnt"; printf '11111111-2222-3333-4444-%012d\n' "$n";;
     *reality-keypair*) n=$((n+1)); echo "$n" > "$cnt"; echo "PrivateKey: PRIVKEY_$n"; echo "PublicKey: PUBKEY_$n";;
     *rand*) n=$((n+1)); echo "$n" > "$cnt"; echo "cGFzc3dvcmQxMjM0NTY3ODkw$n";;
@@ -85,6 +138,31 @@ exit 0
 EOF
 chmod +x "$T/bin/sing-box"
 rm -f "$T/gen.counter"
+
+# fail2ban-client 桩：对齐真实 `fail2ban-client status` 的输出格式。
+# 旧版写反引号：echo "`- Jail list`: ..." 在桩运行时会执行命令替换 ——
+# 字段名 "Jail list" 从 stdout 丢失、stderr 多一行 command not found，
+# 主脚本 grep -i 'Jail list' 的解析成功分支从未被走到。
+cat > "$T/bin/fail2ban-client" <<'EOF'
+#!/usr/bin/env bash
+echo 'Status'
+echo '|- Number of jail:'$'\t''1'
+echo '`- Jail list:'$'\t''sshd, recidive'
+exit 0
+EOF
+chmod +x "$T/bin/fail2ban-client"
+
+# caddy 桩：validate 时要求配置文件存在且非空（恒真桩会把「Caddyfile 没写出来」放行）
+cat > "$T/bin/caddy" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "validate" ]]; then
+    f=""; prev=""
+    for a in "$@"; do [[ $prev == "--config" ]] && f="$a"; prev="$a"; done
+    [[ -n $f && -s $f ]] || { echo "caddy(stub): 配置文件缺失或为空: ${f:-<未指定>}" >&2; exit 1; }
+fi
+exit 0
+EOF
+chmod +x "$T/bin/caddy"
 
 # acme.sh 桩：生成一张 CN/SAN 与 -d 域名一致的真实自签证书。
 # 以前只写 "FAKE CERT" 文本，模块 7 新增的证书域名校验就永远走不到"匹配"分支，

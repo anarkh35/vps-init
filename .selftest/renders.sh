@@ -680,6 +680,17 @@ expect "只读命令 + --rotate-secrets 给出忽略警告" '1' \
     "$(grep -c '与只读命令' "$SELF/render.err" || true)"
 
 echo
+echo "=========== R41 --tcp-bw 取值校验（此前 unit 层只有恒真伪断言） ==========="
+run --print-config --ips 1.2.3.4 --tcp-bw 0
+expect "tcp-bw 0 被拒绝（rc=1）" '1' "$RC"
+expect "报错说明应为正整数" '1' \
+    "$(grep -c '应为正整数' "$SELF/render.err" || true)"
+run --print-config --ips 1.2.3.4 --tcp-bw 0100
+expect "tcp-bw 前导零被拒绝（rc=1）" '1' "$RC"
+run --print-config --ips 1.2.3.4 --tcp-bw 1000
+expect "tcp-bw 正整数放行（rc=0）" '0' "$RC"
+
+echo
 echo "================================================"
 printf '通过 %d 项，失败 %d 项\n' "$pass" "$fail"
 [[ $fail -eq 0 ]]

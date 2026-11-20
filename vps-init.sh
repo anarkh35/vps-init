@@ -394,6 +394,14 @@ apt_update() {
     [[ $APT_UPDATED -eq 1 ]] && return 0
     export DEBIAN_FRONTEND=noninteractive
     apt_wait_lock
+    # 上次 apt/dpkg 被中断的自愈：升级耗时長，SSH 掉线 / Ctrl-C / 断电后 dpkg 会留下
+    # pending 状态，锁虽已随进程释放，但此后每次 apt-get 都会报
+    # "dpkg was interrupted, you must manually run 'dpkg --configure -a'" ——
+    # 若不自愈，重跑永远卡死在同一点。检测到残留就先修复。
+    if [[ -n "$(dpkg -C 2>/dev/null || true)" ]]; then
+        info "检测到 dpkg 中断残留，执行 dpkg --configure -a 修复"
+        dpkg --configure -a || warn "dpkg --configure -a 未完全成功，后续安装可能失败，请查看上方输出"
+    fi
     apt-get update -qq
     APT_UPDATED=1
 }
@@ -1364,6 +1372,10 @@ STATE_KEYS=(SSH_PORT TZ_NAME VLESS_PORT HY2_PORT FALLBACK_PORT HOP_RANGE IP_LIST
 # 复用逻辑处理，否则每次重跑都会重新要求 CF Token。
 CRED_KEYS=(UUID SHORT_ID HY2_PW OBFS_PW REALITY_PRIV REALITY_PUB CERT_HASH CERT_SHA256)
 CRED_ROTATED=0
+# 状态/配置分叉标记：模块 6 把轮换后的新凭据写入 state.env、而磁盘上仍有旧
+# config.json 时置 1 —— 此后模块 7/8 失败出口据此提醒用户必须重选「生成新配置」，
+# 否则 keep 重跑会按 state 的新凭据渲染出「与线上不一致」的假配置。
+SB_STATE_AHEAD=0
 regen_credentials() { # [force] force=1 时连命令行显式指定的值也清空（「生成新配置」专用）
     local k force="${1:-0}"
     CRED_ROTATED=0
@@ -1912,9 +1924,12 @@ NTPJOB
     fi
     unset _try
 
-    # 低内存机器补 swap
+    # 低内存机器补 swap。判据用「swap 已激活」而不是「文件存在」：进程被杀（SSH
+    # 掉线 / Ctrl-C）可能留下 /swapfile 已创建但未 swapon 的半成品，按文件判断
+    # 会让重跑永远跳过创建，内存不足的状态被永久固化。
     local mem_mb; mem_mb=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
-    if [[ $mem_mb -lt 900 ]] && [[ ! -f /swapfile ]]; then
+    if [[ $mem_mb -lt 900 ]] \
+       && ! { swapon --show=NAME --noheadings 2>/dev/null | grep -qx '/swapfile'; }; then
         if ask_yn "内存仅 ${mem_mb}MB，是否创建 1G swap？" y; then
             if fallocate -l 1G /swapfile && chmod 600 /swapfile && mkswap /swapfile >/dev/null && swapon /swapfile; then
                 grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
@@ -2102,15 +2117,25 @@ EOF
         fi
     fi
 
-    # socket 激活与 service 两种场景分别重启
+    # socket 激活与 service 两种场景分别重启。restart 是「先停后启」：
+    # sshd -t 只验语法不验绑定，新端口被占用时旧 sshd 已停、新的起不来 ——
+    # 这是最危险的锁死路径，必须回滚配置并按原端口拉起，不能只报错。
     if systemctl is-enabled --quiet ssh.socket 2>/dev/null; then
         systemctl restart ssh.socket
     else
         systemctl restart ssh 2>/dev/null || systemctl restart sshd
     fi
     sleep 1
-    systemctl is-active --quiet ssh || systemctl is-active --quiet sshd \
-        || systemctl is-active --quiet ssh.socket || die "SSH 服务未正常运行，请检查"
+    if ! { systemctl is-active --quiet ssh || systemctl is-active --quiet sshd \
+        || systemctl is-active --quiet ssh.socket; }; then
+        # 回滚：恢复主配置、删除 drop-in 与 socket 端口覆盖，再尝试按原配置重启
+        cp -a "/root/.vps-init.sshd_config.${ts}.bak" /etc/ssh/sshd_config 2>/dev/null || true
+        rm -f /etc/ssh/sshd_config.d/00-vps-init.conf
+        rm -f /etc/systemd/system/ssh.socket.d/10-port.conf
+        systemctl daemon-reload 2>/dev/null || true
+        systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
+        die "SSH 服务未正常运行（常见原因：新端口被占用），已回滚 sshd 配置并尝试按原端口重启；请保留当前连接，另行验证登录后排查"
+    fi
 
     # 端口监听自检：不用 `ss | grep -q`——grep 命中即退出会让 ss 吃 SIGPIPE(141)，
     # pipefail 下整条管道非零，明明在监听却报「未发现监听」。
@@ -2220,6 +2245,16 @@ m_firewall() {
         # Hysteria2 端口跳跃：UDP 段重定向到监听端口
         # --to-destination 只改端口、保留原始目的 IP，因此多 IP + 按 IP 监听的入站同样适用
         if [[ -n $HOP_RANGE && $hop_fw -eq 1 && $proxy_ok -eq 1 ]]; then
+            # 先清扫历史运行的旧目标端口 DNAT：ipt_add 的 -C 按完整参数匹配，
+            # 换端口重跑（如 --hy2-port B）时旧规则不匹配会被 -A 追加在后面，
+            # 而 PREROUTING 首条命中生效 —— 旧规则在前会把整段 UDP 转到已无人
+            # 监听的旧端口，hy2 静默不可达，doctor 却按「新规则在位」报健康。
+            local _oldp
+            while read -r _oldp; do
+                [[ -n $_oldp && "$_oldp" != "$HY2_PORT" ]] || continue
+                ipt_un "$fw" -t nat PREROUTING -p udp --dport "$HOP_RANGE" -j DNAT --to-destination ":$_oldp"
+            done < <("$fw" -t nat -S PREROUTING 2>/dev/null \
+                    | sed -n "/--dport ${HOP_RANGE//\//\\/}/s/.*--to-destination :\\([0-9]*\\).*/\\1/p" | sort -u)
             ipt_add_nat "$fw" PREROUTING -p udp --dport "$HOP_RANGE" -j DNAT --to-destination ":${HY2_PORT}" \
                 || warn "${fw} 的 nat 表不可用，端口跳跃在该协议族下无效（常见：IPv6 NAT 被裁剪）"
         fi
@@ -2519,15 +2554,32 @@ EOF
     #   CERT_HASH   = 公钥 DER 的 sha256 + base64 → sing-box 的 certificate_public_key_sha256
     #   CERT_SHA256 = 整张证书的 sha256（hex）   → Hysteria2 URI 的 pinSHA256
     if [[ -s ${SB_DIR}/cert.crt ]]; then
-        CERT_HASH="$(openssl x509 -in "${SB_DIR}/cert.crt" -pubkey -noout | \
-                     openssl pkey -pubin -outform DER | \
-                     openssl dgst -sha256 -binary | openssl enc -base64)"
+        # || true 兜底：mv 已把新证书落盘，若指纹计算意外失败（磁盘满等）绝不能在
+        # save_state 之前中止 —— 否则磁盘是新证书、state 里残留旧指纹，keep 重跑
+        # 会按旧指纹 pin 导致握手必失败。失败置空后由既有降级路径兜底
+        # （JSON → insecure，链接 → insecure=1），state 与磁盘不再分叉。
+        CERT_HASH="$(openssl x509 -in "${SB_DIR}/cert.crt" -pubkey -noout 2>/dev/null | \
+                     openssl pkey -pubin -outform DER 2>/dev/null | \
+                     openssl dgst -sha256 -binary 2>/dev/null | openssl enc -base64 2>/dev/null)" || true
         CERT_SHA256="$(openssl x509 -in "${SB_DIR}/cert.crt" -outform DER 2>/dev/null \
-                     | openssl dgst -sha256 2>/dev/null | sed 's/^.*= //' | tr -d ' \r\n')"
+                     | openssl dgst -sha256 2>/dev/null | sed 's/^.*= //' | tr -d ' \r\n')" || true
         [[ ${#CERT_SHA256} -eq 64 ]] || CERT_SHA256=""
     fi
     ok "证书指纹：链接 pinSHA256=${CERT_SHA256:-<未取到>}；JSON 公钥哈希=${CERT_HASH:-<未取到>}"
+    # 分叉点：凭据轮换且旧 config.json 仍在磁盘上，此刻 state.env 与 config.json
+    # 已经不一致；后续任何失败出口都要据此给出准确的恢复指引。
+    [[ $CRED_ROTATED -eq 1 && -f $SB_CONF ]] && SB_STATE_AHEAD=1
     save_state
+}
+
+# 模块 6 轮换凭据后模块 8 渲染/校验失败时的统一提醒。
+# 不能只在「未选模块 8/9」时提醒（2473 行区）——「选了但失败了」这条路同样会分叉。
+warn_state_config_divergence() {
+    [[ ${SB_STATE_AHEAD:-0} -eq 1 ]] || return 0
+    warn "模块 6 已把新凭据写入 ${STATE_FILE}，但 config.json 未更新成功，两者已分叉："
+    warn "  下次重跑必须选「生成新配置」重新应用新凭据；选「沿用旧配置」将按旧凭据继续运行，"
+    warn "  而摘要 / 分享链接会按 state.env 的新凭据渲染 —— 与线上不一致，导入必失败"
+    return 0
 }
 
 # ============================================================
@@ -2621,15 +2673,17 @@ m_reality() {
                 --key-file       "${SB_DIR}/cert/private.key" \
                 --fullchain-file "${SB_DIR}/cert/fullchain.cer" \
                 --reloadcmd      "chown -R caddy:caddy ${SB_DIR}/cert; chmod 600 ${SB_DIR}/cert/private.key; systemctl reload caddy"; then
+                warn_state_config_divergence
                 die "证书安装失败，请检查域名解析与 CF Token 权限（需 Zone.DNS 编辑权限）"
             fi
             [[ -s ${SB_DIR}/cert/private.key && -s ${SB_DIR}/cert/fullchain.cer ]] \
-                || die "证书安装失败：证书文件为空，请检查 acme.sh 输出"
+                || { warn_state_config_divergence; die "证书安装失败：证书文件为空，请检查 acme.sh 输出"; }
             # 旧实现只看"文件存在"：签发失败后目录里残留的旧域名证书会被当成成功，
             # Caddy 拿着错域名的证书，Reality 握手必然失败。这里确认装回来的是当前域名。
             if cert_domain_matches "${SB_DIR}/cert/fullchain.cer" "$DOMAIN"; then
                 ok "证书校验通过：CN/SAN 与 ${DOMAIN} 匹配"
             elif openssl x509 -in "${SB_DIR}/cert/fullchain.cer" -noout -subject >/dev/null 2>&1; then
+                warn_state_config_divergence
                 die "装回的证书与 ${DOMAIN} 不匹配（可能残留了旧域名证书），Reality 握手会失败"
             else
                 # openssl 不可用 / 证书格式异常时保持兼容：只告警，不中断部署
@@ -3954,18 +4008,22 @@ m_genconfig() {
     local cfg_new="${SB_CONF}.new"
     # umask 077：.new 里已是完整服务端配置（含凭据），不能按默认 umask 落盘
     if ! ( umask 077; render_config > "$cfg_new" ); then
-        err "配置渲染失败，原配置保持不变"; rm -f "$cfg_new"; return 1
+        err "配置渲染失败，原配置保持不变"; rm -f "$cfg_new"
+        warn_state_config_divergence
+        return 1
     fi
     # 渲染链里的 die 跑在命令替换的子 shell 中，只终止子 shell，父进程可能拿到
     # 半截输出（那一行变空、后续照常拼）。这里先做一次零依赖结构自检，
     # 免得用户面对 sing-box check 的一句难懂解析报错。
     if ! json_balance_ok "$(cat "$cfg_new")"; then
         err "渲染结果不是合法 JSON（括号/引号不配平），原配置保持不变；新内容留在 ${cfg_new} 供排查"
+        warn_state_config_divergence
         return 1
     fi
     chmod 600 "$cfg_new"
     if ! sing-box check -c "$cfg_new"; then
         err "配置校验失败，原配置保持不变（新内容留在 ${cfg_new} 供排查）"
+        warn_state_config_divergence
         return 1
     fi
     mv -f "$cfg_new" "$SB_CONF"
@@ -3974,7 +4032,13 @@ m_genconfig() {
     systemctl enable --now sing-box >/dev/null
     systemctl restart sing-box
     sleep 2
-    systemctl is-active --quiet sing-box || { err "sing-box 未启动，日志：journalctl -u sing-box -e"; return 1; }
+    if ! { systemctl is-active --quiet sing-box; }; then
+        # 这里 config.json 已是新凭据（mv 已完成），只是服务没起来：
+        # 与渲染/校验失败不同，此时 keep 重跑反而能按新配置校验并启动。
+        err "sing-box 未启动，日志：journalctl -u sing-box -e"
+        warn "config.json 已更新为新凭据但服务未运行：修复后重跑选「沿用旧配置」即可按新配置校验并启动"
+        return 1
+    fi
     ok "sing-box 运行中"
     save_state
 }
@@ -6033,7 +6097,10 @@ main() {
         exit $?
     fi
 
-    # 从这里开始是写路径（向导写 state、模块写配置/防火墙）：先拿实例互斥锁
+    # 从这里开始是写路径（向导写 state、模块写配置/防火墙）：先拿实例互斥锁。
+    # ERR trap 必须在进入向导 / NAT 适配之前就装好：这几段若发生非 die 的意外失败，
+    # set -e 会静默退出，没有行号输出会让用户完全摸不着头脑。
+    trap 'rc=$?; err "脚本在第 ${LINENO} 行出错（退出码 ${rc}）。已完成步骤不会自动回滚，请查看上方输出。"; exit $rc' ERR
     acquire_instance_lock
     preflight
     # --rotate-secrets：轻量换钥匙（只跑模块 6/8/9），先确认意图再动凭据
@@ -6097,8 +6164,6 @@ main() {
         fi
         save_state      # CLI --manage-only 路径没进向导，这里保证决策落盘
     fi
-
-    trap 'rc=$?; err "脚本在第 ${LINENO} 行出错（退出码 ${rc}）。已完成步骤不会自动回滚，请查看上方输出。"; exit $rc' ERR
 
     local i count=0
     for i in "${!MOD_ON[@]}"; do [[ ${MOD_ON[$i]} -eq 1 ]] && count=$((count+1)); done
