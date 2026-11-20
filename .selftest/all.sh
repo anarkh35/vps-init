@@ -28,10 +28,11 @@ stage() { # stage <显示名> <命令...>
         else
             echo "---- ${name} 通过 ----"
         fi
+        command rm -f "$log"
     else
-        echo "---- ${name} 失败 ----"; rc=1
+        # 失败时保留完整日志：输出可能被终端截断，日志是唯一无截断的现场
+        echo "---- ${name} 失败（完整日志保留：${log}）----"; rc=1
     fi
-    rm -f "$log"
 }
 
 echo "==> 语法检查"

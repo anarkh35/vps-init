@@ -75,25 +75,102 @@ echo
 echo "===== B. --no-hop 不再生成 --dport 为空的非法规则 ====="
 rm -f "$T/root/.vps-init/state.env"        # 清掉 A 段残留，避免端口被状态文件改写
 IPT_LOG="$PWD/$T/ipt.log"
-export IPT_LOG
+IPT_RULES4="$PWD/$T/ipt-rules4.txt"; IPT_RULES6="$PWD/$T/ipt-rules6.txt"
+export IPT_LOG IPT_RULES4 IPT_RULES6
+: > "$IPT_RULES4"; : > "$IPT_RULES6"
+# 有状态记账桩：-C 只在规则已在位时返回 0，-A/-I 真实追加，-D 真实删除，-S 真实输出。
+# 旧版「-C 恒返回 1」会让模块 3 的 SSH -C 校验 die（B 段实际中途死掉仍判 PASS 的假绿），
+# ipt_un 的幂等删除循环也从未真正执行过 —— 必须忠实模拟「幂等追加」语义。
 cat > "$VBIN/iptables" <<'EOF'
 #!/usr/bin/env bash
-[[ "${1:-}" == "-C" ]] && exit 1          # 模拟规则不存在，让 ipt_add 走到 -A
-printf '%s\n' "$*" >> "$IPT_LOG"
-exit 0
+_self="$(basename "$0")"
+case "$_self" in
+    iptables)  _f="${IPT_RULES4:?}" ;;
+    ip6tables) _f="${IPT_RULES6:?}" ;;
+    *) exit 64 ;;
+esac
+_full="$*"
+# -t 可能出现在任意位置（脚本 ipt_un 传参形如 iptables -C -t nat ...），
+# 真实 iptables 会在任意位置提取 -t 表名，这里同样处理后再取命令与规则。
+_t="filter"; _args=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -t) _t="$2"; shift 2 ;;
+        *)  _args+=("$1"); shift ;;
+    esac
+done
+[[ ${#_args[@]} -gt 0 ]] || exit 0
+_op="${_args[0]}"
+_rest=("${_args[@]:1}")
+[[ "$_op" == "-C" ]] || printf '%s\n' "$_full" >> "$IPT_LOG"   # 保持旧桩约定：-C 探针不入日志
+# 记账行归一化：真实 iptables 的 -C / -D 匹配不含 -I 的位置参数，必须剥掉，
+# 否则 -I INPUT 1 <规则> 入账后，-C INPUT <规则> 永远匹配不上（SSH 校验假 die）。
+case "$_op" in
+    -C|-A|-D) _rule="[${_t}] ${_rest[*]}" ;;
+    -I) if [[ ${_rest[1]:-} =~ ^[0-9]+$ ]]; then _rule="[${_t}] ${_rest[0]} ${_rest[*]:2}"; else _rule="[${_t}] ${_rest[*]}"; fi ;;
+    *) _rule="" ;;
+esac
+case "$_op" in
+    -C) grep -Fqx -- "$_rule" "$_f" ;;
+    -A|-I) printf '%s\n' "$_rule" >> "$_f"; exit 0 ;;
+    -D) { grep -Fvx -- "$_rule" "$_f" || true; } > "$_f.tmp" && mv "$_f.tmp" "$_f"; exit 0 ;;
+    -S) if [[ ${#_rest[@]} -gt 0 ]]; then grep -F -- "[${_t}] ${_rest[*]}" "$_f" || true; else cat "$_f"; fi ;;
+    -P|-L|-F|-Z|-N|-X|-E) exit 0 ;;
+    *) exit 0 ;;
+esac
 EOF
 cp "$VBIN/iptables" "$VBIN/ip6tables"; chmod +x "$VBIN/iptables" "$VBIN/ip6tables"
 
 : > "$IPT_LOG"
 bash "$T/run-copy.sh" --yes --modules 3 --no-hop --hy2-port 16407 >/dev/null 2>&1
+_rc=$?
+chk "B0 关闭跳跃时模块 3 完整跑通（rc=0；旧桩下 SSH 校验 die 得 rc=1）" "0" "$_rc"
 chk "B1 关闭跳跃时没有任何残缺的 --dport 规则" "0" "$(grep -cE 'dport +-j' "$IPT_LOG")"
 chk "B2 关闭跳跃时仍放行 hy2 主端口（v4+v6 各一条，插链首）" "2" "$(grep -cE -- '-I INPUT 1 -p udp --dport 16407 -j ACCEPT' "$IPT_LOG")"
 chk "B3 关闭跳跃时不生成 DNAT 规则" "0" "$(grep -cE 'PREROUTING.*DNAT' "$IPT_LOG")"
 
-: > "$IPT_LOG"
+: > "$IPT_LOG"; : > "$IPT_RULES4"; : > "$IPT_RULES6"
 bash "$T/run-copy.sh" --yes --modules 3 --hop-range 30000:50000 --hy2-port 16407 >/dev/null 2>&1
+_rc=$?
+chk "B4a 开启跳跃时模块 3 完整跑通（rc=0）" "0" "$_rc"
 chk "B4 开启跳跃时按范围放行（v4+v6 各一条，插链首）" "2" "$(grep -cE -- '-I INPUT 1 -p udp --dport 30000:50000 -j ACCEPT' "$IPT_LOG")"
 chk "B5 开启跳跃时生成 DNAT 重定向（v4+v6 各一条）" "2" "$(grep -cE 'PREROUTING.*DNAT --to-destination :16407' "$IPT_LOG")"
+
+echo
+echo "===== B2. 跳跃段变更后的旧规则清扫（换范围 / --no-hop / 换目标端口）====="
+# 沙箱记账文件里预置上一轮部署留下的旧范围规则（v4+v6），换新范围重跑模块 3，
+# 旧 INPUT 放行与旧 DNAT 必须被清掉，否则 UDP 段继续转到无人监听的旧端口。
+cat > "$IPT_RULES4" <<'EOF'
+[filter] INPUT -p udp --dport 30000:50000 -j ACCEPT
+[nat] PREROUTING -p udp --dport 30000:50000 -j DNAT --to-destination :16407
+EOF
+cat > "$IPT_RULES6" <<'EOF'
+[filter] INPUT -p udp --dport 30000:50000 -j ACCEPT
+[nat] PREROUTING -p udp --dport 30000:50000 -j DNAT --to-destination :16407
+EOF
+: > "$IPT_LOG"
+bash "$T/run-copy.sh" --yes --modules 3 --hop-range 31000:51000 --hy2-port 16407 >/dev/null 2>&1
+_rc=$?
+chk "B6 换范围重跑模块 3 完整跑通（rc=0）" "0" "$_rc"
+chk "B7 旧范围 INPUT 放行已清扫（v4+v6 各一条 -D）" "2" "$(grep -cE -- '-D INPUT -p udp --dport 30000:50000 -j ACCEPT' "$IPT_LOG")"
+chk "B8 旧范围 DNAT 已清扫（v4+v6 各一条 -D）" "2" "$(grep -cE -- 'PREROUTING -p udp --dport 30000:50000 -j DNAT --to-destination :16407' "$IPT_LOG")"
+chk "B9 新范围 INPUT 放行在位（v4+v6 各一条）" "2" "$(grep -cE -- '-I INPUT 1 -p udp --dport 31000:51000 -j ACCEPT' "$IPT_LOG")"
+chk "B10 新范围 DNAT 在位（v4+v6 各一条）" "2" "$(grep -cE -- 'PREROUTING -p udp --dport 31000:51000 -j DNAT --to-destination :16407' "$IPT_LOG")"
+
+: > "$IPT_LOG"; : > "$IPT_RULES4"; : > "$IPT_RULES6"
+cat > "$IPT_RULES4" <<'EOF'
+[filter] INPUT -p udp --dport 31000:51000 -j ACCEPT
+[nat] PREROUTING -p udp --dport 31000:51000 -j DNAT --to-destination :16407
+EOF
+cat > "$IPT_RULES6" <<'EOF'
+[filter] INPUT -p udp --dport 31000:51000 -j ACCEPT
+[nat] PREROUTING -p udp --dport 31000:51000 -j DNAT --to-destination :16407
+EOF
+bash "$T/run-copy.sh" --yes --modules 3 --no-hop --hy2-port 16407 >/dev/null 2>&1
+_rc=$?
+chk "B11 --no-hop 重跑后旧跳跃段 INPUT 放行已清扫" "2" "$(grep -cE -- '-D INPUT -p udp --dport 31000:51000 -j ACCEPT' "$IPT_LOG")"
+chk "B12 --no-hop 重跑后旧跳跃段 DNAT 已清扫" "2" "$(grep -cE -- 'PREROUTING -p udp --dport 31000:51000 -j DNAT --to-destination :16407' "$IPT_LOG")"
+chk "B13 --no-hop 重跑模块 3 完整跑通（rc=0）" "0" "$_rc"
 
 echo
 echo "===== C. 自动探测排除私网地址 / 轮换中的临时 IPv6 ====="
@@ -133,8 +210,9 @@ APT_LOG="$PWD/$T/apt.log"; export APT_LOG
 mkdir -p "$T/etc/apt/sources.list.d"
 cat > "$VBIN/apt-get" <<'EOF'
 #!/usr/bin/env bash
-if [[ "${1:-}" == "update" ]]; then echo "update" >> "$APT_LOG"; exit 0; fi
-echo "install $*" >> "$APT_LOG"
+_log="${APT_LOG:-/dev/null}"    # B 段等早于 D 段的运行未设 APT_LOG，不能让重定向炸掉
+if [[ "${1:-}" == "update" ]]; then echo "update" >> "$_log"; exit 0; fi
+echo "install $*" >> "$_log"
 exit 0
 EOF
 chmod +x "$VBIN/apt-get"

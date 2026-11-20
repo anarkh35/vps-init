@@ -260,6 +260,9 @@ chk "速率白名单拦截非数字"  '1' "$(rc is_rate abc)"
 # 此前两行断言用 bash -c 测正则本身，是恒真伪断言 —— 已改为打真函数，并在 renders 层补 CLI 级场景）
 chk "tcp-bw 拦截 0（validate_settings）"     '1' "$( ( TCP_BW=0; validate_settings ) >/dev/null 2>&1 && echo 0 || echo 1 )"
 chk "tcp-bw 放行正整数（validate_settings）"  '0' "$( ( TCP_BW=1000; validate_settings ) >/dev/null 2>&1 && echo 0 || echo 1 )"
+chk "sb-up-mbps 拦截非数字（validate_settings）" '1' "$( ( SB_UP_MBPS=abc; SB_DOWN_MBPS=500; validate_settings ) >/dev/null 2>&1 && echo 0 || echo 1 )"
+chk "sb-down-mbps 拦截前导零（validate_settings）" '1' "$( ( SB_UP_MBPS=200; SB_DOWN_MBPS=0500; validate_settings ) >/dev/null 2>&1 && echo 0 || echo 1 )"
+chk "sb-bandwidth 放行合法值（validate_settings）" '0' "$( ( SB_UP_MBPS=200; SB_DOWN_MBPS=500; validate_settings ) >/dev/null 2>&1 && echo 0 || echo 1 )"
 TCP_BW=""
 chk "REALITY_DEST 放行 IPv6" '0' "$(rc need_host --reality-dest 2001:db8::1)"
 

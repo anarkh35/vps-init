@@ -234,11 +234,7 @@ exit 0
 EOF
 chmod +x "$T/bin/timedatectl"
 
-cat > "$T/bin/fail2ban-client" <<'EOF'
-#!/usr/bin/env bash
-echo "Status for the jail: sshd"; echo "`- Jail list`:   sshd, recidive"
-exit 0
-EOF
-chmod +x "$T/bin/fail2ban-client"
-
+# fail2ban-client 桩只在文件前段定义一次（单引号 heredoc，`` 字面输出）。
+# 此处不再重复定义：旧版双引号 heredoc 里的反引号会被 bash 执行，
+# 静默覆盖前段的正确桩，让 jail 列表字段被吞掉。
 export PATH="$PWD/$T/bin:$PATH"

@@ -1169,6 +1169,12 @@ validate_settings() {
     esac
     [[ -z ${TCP_BW:-} ]] || [[ ${TCP_BW} =~ ^[1-9][0-9]*$ ]] \
         || die "--tcp-bw 非法：应为正整数（Mbps），如 1000（收到: $TCP_BW）"
+    # SB_* 与 TCP_BW 同权兜底：state.env 被手工改坏（如写入 abc）时在此就报错，
+    # 否则要拖到渲染层 j_lit 才 die，且报错不指向 state.env。
+    [[ -z ${SB_UP_MBPS:-} ]] || [[ ${SB_UP_MBPS} =~ ^[1-9][0-9]*$ ]] \
+        || die "SB_UP_MBPS 非法（${STATE_FILE}）：应为正整数（Mbps）（收到: $SB_UP_MBPS）"
+    [[ -z ${SB_DOWN_MBPS:-} ]] || [[ ${SB_DOWN_MBPS} =~ ^[1-9][0-9]*$ ]] \
+        || die "SB_DOWN_MBPS 非法（${STATE_FILE}）：应为正整数（Mbps）（收到: $SB_DOWN_MBPS）"
     # 跳跃范围覆盖 hy2 端口时，DNAT 会把落在监听端口上的包再次改写成同一端口，语义混乱
     if [[ -n $HOP_RANGE ]]; then
         local a="${HOP_RANGE%%:*}" b="${HOP_RANGE##*:}"
@@ -1537,7 +1543,10 @@ restore_server_params_for_keep() {
     [[ ${RERUN_MODE:-} == keep ]] || return 0
     [[ -f $STATE_FILE ]] || return 0
     local k line v _touched=""
-    for k in DOMAIN REALITY_SNI REALITY_DEST REALITY_DEST_PORT \
+    # 端口三件套必须一并恢复：keep 下 config.json 不重写，sing-box 仍监听旧端口；
+    # 但模块 3 防火墙 / 模块 9 分享链接会拿新端口下发 —— 新端口对外放行、旧端口才在监听，
+    # 节点静默不可达（Reality 的 fallback-port 甚至会直接打断回落握手）。
+    for k in DOMAIN VLESS_PORT HY2_PORT FALLBACK_PORT REALITY_SNI REALITY_DEST REALITY_DEST_PORT \
              TCP_KEEP_ALIVE TCP_KEEP_ALIVE_INTERVAL HOP_INTERVAL HOP_INTERVAL_MAX; do
         [[ -n ${CLI_SET[$k]:-} ]] || continue
         v=""
@@ -1574,6 +1583,7 @@ ask_client_domains() { # 交互式部署前按 v4 / v6 分别询问客户端 ser
     [[ -z ${MODULES_ARG:-} ]] || return 0
     stdin_is_tty || return 0
     local d4 d6 a4 a6 old_force="${CLIENT_DOMAIN_FORCE_IP:-0}"
+    local old4="${CLIENT_DOMAIN_V4:-}" old6="${CLIENT_DOMAIN_V6:-}"
     # 已有分族值优先；否则把共用域名当默认值，直接回车即保持「两族共用」的旧语义。
     d4="${CLIENT_DOMAIN_V4:-${CLIENT_DOMAIN:-}}"
     d6="${CLIENT_DOMAIN_V6:-${CLIENT_DOMAIN:-}}"
@@ -1582,8 +1592,11 @@ ask_client_domains() { # 交互式部署前按 v4 / v6 分别询问客户端 ser
     printf '  留空 = 该族回退到共用域名 / 回落域名 / IP；输入 - 表示清掉已存的值\n'
     a4="$(ask_client_domain "v4 节点域名" "$d4")"
     a6="$(ask_client_domain "v6 节点域名" "$d6")"
-    CLIENT_DOMAIN_V4="$a4"
-    CLIENT_DOMAIN_V6="$a6"
+    # 回车沿用默认（该族此前未设专属、默认值来自共用域名）时**不**把共用域名
+    # 物化进分族键 —— 物化会让之后改 --client-domain 无法传播到该族，
+    # 也与上方「留空 = 该族回退到共用域名」的说明自相矛盾。
+    if [[ -z $old4 && $a4 == "${CLIENT_DOMAIN:-}" ]]; then CLIENT_DOMAIN_V4=""; else CLIENT_DOMAIN_V4="$a4"; fi
+    if [[ -z $old6 && $a6 == "${CLIENT_DOMAIN:-}" ]]; then CLIENT_DOMAIN_V6=""; else CLIENT_DOMAIN_V6="$a6"; fi
     if [[ -z $a4 && -z $a6 ]]; then
         # 两族都清空：共用域名一并清掉，避免「看着分开了、实际又回退到同一个域名」。
         CLIENT_DOMAIN=""
@@ -2232,6 +2245,26 @@ m_firewall() {
             if [[ $fw == "iptables"  && ${NAT_V4_OPEN:-0} -eq 0 ]]; then hop_fw=0; fi
             if [[ $fw == "ip6tables" && ${NAT_V6_OPEN:-0} -eq 0 ]]; then hop_fw=0; fi
         fi
+        # 历史跳跃规则清扫：换范围 / --no-hop / 族由全开放转受限后，旧的整段放行
+        # 与 DNAT 不会自动消失（ipt_add 的 -C 按完整参数匹配，换参数只会追加新规则），
+        # 残留规则会继续把 UDP 段转发到已无人监听的端口 —— 必须在追加新规则前删掉。
+        local _hop_keep=0 _hop_line _hop_r _hop_d
+        [[ -n ${HOP_RANGE:-} && $hop_fw -eq 1 && $proxy_ok -eq 1 ]] && _hop_keep=1
+        while IFS= read -r _hop_line; do
+            [[ $_hop_line == *'--dport '*'-j ACCEPT' ]] || continue
+            _hop_r="${_hop_line#*--dport }"; _hop_r="${_hop_r%% -j*}"
+            [[ $_hop_r == *:* ]] || continue
+            if [[ $_hop_keep -eq 1 && $_hop_r == "$HOP_RANGE" ]]; then continue; fi
+            ipt_un "$fw" INPUT -p udp --dport "$_hop_r" -j ACCEPT
+        done < <("$fw" -S INPUT 2>/dev/null | grep -E -- '--dport [0-9]+:[0-9]+ .*-j ACCEPT' || true)
+        while IFS= read -r _hop_line; do
+            [[ $_hop_line == *'--dport '*'-j DNAT'* ]] || continue
+            _hop_r="${_hop_line#*--dport }"; _hop_r="${_hop_r%% *}"
+            _hop_d="${_hop_line#*--to-destination :}"; _hop_d="${_hop_d%% *}"
+            [[ $_hop_r == *:* && -n $_hop_d ]] || continue
+            if [[ $_hop_keep -eq 1 && $_hop_r == "$HOP_RANGE" && $_hop_d == "$HY2_PORT" ]]; then continue; fi
+            ipt_un "$fw" -t nat PREROUTING -p udp --dport "$_hop_r" -j DNAT --to-destination ":$_hop_d"
+        done < <("$fw" -t nat -S PREROUTING 2>/dev/null | grep -E -- '--dport [0-9]+:[0-9]+ .*-j DNAT' || true)
         # HOP_RANGE 为空（--no-hop）时必须跳过，否则会拼出 "-p udp --dport -j ACCEPT" 的非法规则
         if [[ -n $HOP_RANGE && $hop_fw -eq 1 && $proxy_ok -eq 1 ]]; then
             ipt_head "$fw" INPUT -p udp --dport "$HOP_RANGE" -j ACCEPT
@@ -2245,16 +2278,8 @@ m_firewall() {
         # Hysteria2 端口跳跃：UDP 段重定向到监听端口
         # --to-destination 只改端口、保留原始目的 IP，因此多 IP + 按 IP 监听的入站同样适用
         if [[ -n $HOP_RANGE && $hop_fw -eq 1 && $proxy_ok -eq 1 ]]; then
-            # 先清扫历史运行的旧目标端口 DNAT：ipt_add 的 -C 按完整参数匹配，
-            # 换端口重跑（如 --hy2-port B）时旧规则不匹配会被 -A 追加在后面，
-            # 而 PREROUTING 首条命中生效 —— 旧规则在前会把整段 UDP 转到已无人
-            # 监听的旧端口，hy2 静默不可达，doctor 却按「新规则在位」报健康。
-            local _oldp
-            while read -r _oldp; do
-                [[ -n $_oldp && "$_oldp" != "$HY2_PORT" ]] || continue
-                ipt_un "$fw" -t nat PREROUTING -p udp --dport "$HOP_RANGE" -j DNAT --to-destination ":$_oldp"
-            done < <("$fw" -t nat -S PREROUTING 2>/dev/null \
-                    | sed -n "/--dport ${HOP_RANGE//\//\\/}/s/.*--to-destination :\\([0-9]*\\).*/\\1/p" | sort -u)
+            # 旧目标端口 / 旧范围的 DNAT 已在上方统一清扫（换端口重跑时旧规则
+            # 若残留会在 PREROUTING 首条命中，把整段 UDP 转到无人监听的端口）。
             ipt_add_nat "$fw" PREROUTING -p udp --dport "$HOP_RANGE" -j DNAT --to-destination ":${HY2_PORT}" \
                 || warn "${fw} 的 nat 表不可用，端口跳跃在该协议族下无效（常见：IPv6 NAT 被裁剪）"
         fi
@@ -4681,10 +4706,13 @@ cmd_doctor() {
     else
         # 规则集先整体捕获再匹配：grep -q 命中即退出会让上游 iptables 吃 SIGPIPE（141），
         # pipefail 下整条管道判假 —— 规则明明在位却被报成「未设 / 未放行」（假阴性）
-        local _in4 _in6 _nat4
+        local _in4 _in6 _nat4 _nat6=""
         _in4="$(iptables -S INPUT 2>/dev/null || true)"
         _in6="$(ip6tables -S INPUT 2>/dev/null || true)"
         _nat4="$(iptables -t nat -S PREROUTING 2>/dev/null || true)"
+        if command -v ip6tables >/dev/null 2>&1; then
+            _nat6="$(ip6tables -t nat -S PREROUTING 2>/dev/null || true)"
+        fi
         if [[ $_in4 == *'-P INPUT DROP'* ]]; then
             dchk ok "iptables INPUT 默认 DROP"
         else
@@ -4707,18 +4735,30 @@ cmd_doctor() {
                 dchk fail "SSH 端口 ${ssh_p} 未放行" "立即处理：iptables -A INPUT -p tcp --dport ${ssh_p} -j ACCEPT（否则会锁死）"
             fi
         done
-        # 端口跳跃 DNAT（只在启用且该族全开放时应当存在）
-        if [[ -n $HOP_RANGE && ${NAT_ACTIVE:-0} -eq 1 ]]; then
-            if [[ $_nat4 == *"--to-destination :${HY2_PORT}"* ]]; then
-                dchk ok "端口跳跃 DNAT 在位" "${HOP_RANGE} → :${HY2_PORT}"
-            elif [[ ${NAT_V4_OPEN:-0} -eq 1 || ${NAT_V6_OPEN:-0} -eq 1 ]]; then
-                dchk fail "端口跳跃 DNAT 缺失" "重跑模块 3；或确认服务商面板已放行 ${HOP_RANGE} 的 UDP"
-            fi
-        elif [[ -n $HOP_RANGE && ${NAT_ACTIVE:-0} -ne 1 ]]; then
-            if [[ $_nat4 == *"--to-destination :${HY2_PORT}"* ]]; then
-                dchk ok "端口跳跃 DNAT 在位" "${HOP_RANGE} → :${HY2_PORT}"
+        # 端口跳跃 DNAT（只在启用且该族全开放时应当存在；v4 / v6 的 nat 表分开查，
+        # 此前只查 v4 —— NAT 机型 v4 受限、v6 全开放时，v6 的 DNAT 缺失体检完全看不见）
+        local _doct_hop_v4=0 _doct_hop_v6=0
+        if [[ -n $HOP_RANGE ]]; then
+            if [[ ${NAT_ACTIVE:-0} -eq 1 ]]; then
+                [[ ${NAT_V4_OPEN:-0} -eq 1 ]] && _doct_hop_v4=1   # 受限族没有整段 DNAT，不作要求
+                [[ ${NAT_V6_OPEN:-0} -eq 1 ]] && _doct_hop_v6=1
             else
-                dchk fail "端口跳跃 DNAT 缺失" "重跑模块 3；并确认服务商防火墙/安全组已放行 ${HOP_RANGE} 的 UDP"
+                _doct_hop_v4=1
+                command -v ip6tables >/dev/null 2>&1 && _doct_hop_v6=1
+            fi
+            if [[ $_doct_hop_v4 -eq 1 ]]; then
+                if [[ $_nat4 == *"--to-destination :${HY2_PORT}"* ]]; then
+                    dchk ok "端口跳跃 DNAT 在位（v4）" "${HOP_RANGE} → :${HY2_PORT}"
+                else
+                    dchk fail "端口跳跃 DNAT 缺失（v4）" "重跑模块 3；并确认服务商防火墙/安全组已放行 ${HOP_RANGE} 的 UDP"
+                fi
+            fi
+            if [[ $_doct_hop_v6 -eq 1 ]]; then
+                if [[ $_nat6 == *"--to-destination :${HY2_PORT}"* ]]; then
+                    dchk ok "端口跳跃 DNAT 在位（v6）" "${HOP_RANGE} → :${HY2_PORT}"
+                else
+                    dchk warn "端口跳跃 DNAT 缺失（v6）" "该族端口跳跃无效（内核/服务商常裁剪 IPv6 NAT）；仅影响 v6 侧跳跃，需要时重跑模块 3"
+                fi
             fi
         fi
     fi
@@ -5514,8 +5554,8 @@ self_test() {
                && -n ${CLI_SET[CLIENT_DOMAIN_FORCE_IP]:-} ]] && echo 1 || echo 0 )"
     st_eq 'restore_client_domain_for_keep 覆盖 v4 专属域名' '1' \
         "$( declare -f restore_client_domain_for_keep | grep -qF 'CLIENT_DOMAIN_V4' && echo 1 || echo 0 )"
-    st_eq 'restore_server_params_for_keep 覆盖 DOMAIN / 保活 / 跳跃键' '1' \
-        "$( declare -f restore_server_params_for_keep | grep -qF 'DOMAIN REALITY_SNI' && \
+    st_eq 'restore_server_params_for_keep 覆盖 DOMAIN / 端口三件套 / 保活 / 跳跃键' '1' \
+        "$( declare -f restore_server_params_for_keep | grep -qF 'DOMAIN VLESS_PORT HY2_PORT FALLBACK_PORT REALITY_SNI' && \
             declare -f restore_server_params_for_keep | grep -qF 'HOP_INTERVAL_MAX' && echo 1 || echo 0 )"
     st_eq 'main 的 keep 恢复链包含服务端参数恢复' '1' \
         "$( declare -f main | grep -qF 'restore_server_params_for_keep' && echo 1 || echo 0 )"
