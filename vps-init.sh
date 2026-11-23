@@ -422,15 +422,17 @@ apt_install() {
 # 成功产物留在 CACHE_DIR（NO_CACHE=1 可强制刷新）。
 # 刻意的取舍：只有"下载"被重试；apt/dpkg 本身互斥，安装步骤保持串行、日志保持线性。
 
-# 缓存文件名：URL 末段（去掉 query）+ URL 校验和前缀。
+# 缓存文件名：URL 末段（去掉 query）+ 完整 URL 校验和前缀。
 # 必须带校验和：否则 https://a/x.sh 与 https://b/x.sh 会共用一个缓存文件，
 # 第二次下载会静默命中别人的内容 —— 这类"缓存污染"极难排查。
+# 校验和必须按完整 URL（含 query）计算：剥掉 query 再算的话，
+# https://a/x.sh?ver=1 与 ?ver=2 会拿到同一个缓存键 —— 升级内容被旧缓存顶掉。
 fetch_cache_path() {
-    local u="${1%%\?*}" name sum
+    local full="$1" u="${1%%\?*}" name sum
     name="${u##*/}"
     [[ -n $name ]] || name="index"
     name="${name//[^A-Za-z0-9._-]/_}"
-    sum="$(printf '%s' "$u" | cksum 2>/dev/null | tr -d ' ' | cut -c1-8)"
+    sum="$(printf '%s' "$full" | cksum 2>/dev/null | tr -d ' ' | cut -c1-8)"
     printf '%s/%s.%s' "$CACHE_DIR" "$name" "${sum:-00000000}"
 }
 
@@ -511,7 +513,13 @@ fetch_file() {
     if [[ -z $NO_CACHE && -s $cached ]]; then
         info "命中下载缓存：${cached}"
         if [[ $dest == "$cached" ]]; then return 0; fi
-        cp -f "$cached" "$dest" 2>/dev/null && return 0
+        # cp 也走 .part + mv：复制中途被打断（Ctrl-C / 断电）不能留下半个目标文件，
+        # 否则下次「目标已存在」的判定会拿到残缺内容。
+        if cp -f "$cached" "${dest}.part" 2>/dev/null && mv -f "${dest}.part" "$dest"; then
+            return 0
+        fi
+        rm -f "${dest}.part" 2>/dev/null || true
+        warn "缓存复制失败，回退网络下载：${cached}"
     fi
 
     local attempt=1 delay="$FETCH_BACKOFF" err="" rc=0
@@ -522,7 +530,9 @@ fetch_file() {
                 mv -f "${dest}.part" "$dest"
                 rm -f "${dest}.err"
                 mkdir -p "$CACHE_DIR" 2>/dev/null || true
-                [[ $dest == "$cached" ]] || cp -f "$dest" "$cached" 2>/dev/null || true
+                # 写缓存同样原子化：半截缓存会被后续运行当作有效内容命中
+                if [[ $dest == "$cached" ]] || { cp -f "$dest" "${cached}.part" 2>/dev/null \
+                    && mv -f "${cached}.part" "$cached"; }; then :; else rm -f "${cached}.part" 2>/dev/null || true; fi
                 (( attempt > 1 )) && info "第 ${attempt} 次尝试下载成功：$url"
                 return 0
             fi
@@ -1374,7 +1384,7 @@ STATE_KEYS=(SSH_PORT TZ_NAME VLESS_PORT HY2_PORT FALLBACK_PORT HOP_RANGE IP_LIST
     SB_UP_MBPS SB_DOWN_MBPS SHAPER_RATE TCP_BW DOMAIN \
     CLIENT_DOMAIN CLIENT_DOMAIN_V4 CLIENT_DOMAIN_V6 CLIENT_DOMAIN_FORCE_IP ACME_CA ACME_EMAIL WEB_PAGE \
     REALITY_SNI REALITY_DEST REALITY_DEST_PORT CERT_CN \
-    UUID REALITY_PRIV REALITY_PUB SHORT_ID HY2_PW OBFS_PW CERT_HASH CERT_SHA256 NODE_NAME)
+    UUID REALITY_PRIV REALITY_PUB SHORT_ID HY2_PW OBFS_PW CERT_HASH CERT_SHA256 NODE_NAME SB_STATE_AHEAD)
 
 # 节点凭据清单：选择「生成新配置」且执行模块 6 时全部重新生成，让旧客户端配置与分享链接作废。
 # 与 STATE_KEYS 分开——前者是「需要持久化」的清单，这里是「生成新配置时必须轮换」的清单。
@@ -1386,6 +1396,9 @@ CRED_ROTATED=0
 # 状态/配置分叉标记：模块 6 把轮换后的新凭据写入 state.env、而磁盘上仍有旧
 # config.json 时置 1 —— 此后模块 7/8 失败出口据此提醒用户必须重选「生成新配置」，
 # 否则 keep 重跑会按 state 的新凭据渲染出「与线上不一致」的假配置。
+# 进 STATE_KEYS 持久化：半失败后进程退出，下次 --status / keep 重跑也能看到警示；
+# 模块 8 成功路径（配置已校验、服务已起）会清零。若用户在脚本外手工修好了
+# config.json，可手工把 state.env 里这行改回 0（或重跑一次模块 8）。
 SB_STATE_AHEAD=0
 regen_credentials() { # [force] force=1 时连命令行显式指定的值也清空（「生成新配置」专用）
     local k force="${1:-0}"
@@ -1468,7 +1481,11 @@ save_state() {
 load_state() {
     [[ -f $STATE_FILE ]] || return 0
     local line k v
-    while IFS= read -r line; do
+    # `|| [[ -n $line ]]`：state.env 若被编辑器去掉末尾换行，最后一行也要读到；
+    # CR 剥离：state.env 是纯手工可编辑文件，Windows 编辑器存成 CRLF 会把 \r
+    # 混进凭据值（UUID 后跟一个 CR）—— 轮换/渲染全部静默变错，必须在这里拦住。
+    while IFS= read -r line || [[ -n $line ]]; do
+        line="${line%$'\r'}"
         [[ $line == *=* ]] || continue
         k="${line%%=*}"; v="${line#*=}"
         # 白名单：state.env 是可以手工编辑的，不能盲信里面的键名
@@ -2513,6 +2530,15 @@ m_singbox() {
         fi
     fi
     command -v sing-box >/dev/null || die "sing-box 安装失败"
+    # 装完必须复核版本：--version 由第三方安装脚本解释，脚本退出 0 不代表真的装了指定版本
+    # （旧版本脚本可能静默忽略未知参数）。宁可 fail-fast，也不让「锁了 1.13 实装 1.11」的
+    # 机器带着版本差继续往下跑配置渲染。
+    if [[ -n $SB_VERSION ]]; then
+        local _ver_now; _ver_now="$(sing-box version 2>/dev/null | head -1 || true)"
+        [[ $_ver_now == *"$SB_VERSION"* ]] \
+            || die "sing-box 版本复核失败：要求 ${SB_VERSION}，实际安装为「${_ver_now:-未知}」。请先 apt-get purge sing-box 后重跑，或手动到 GitHub Releases 安装指定版本"
+        info "sing-box 版本复核通过：${_ver_now}"
+    fi
     # 放开文件句柄上限，高并发下避免 too many open files
     mkdir -p /etc/systemd/system/sing-box.service.d
     cat > /etc/systemd/system/sing-box.service.d/10-limits.conf <<'EOF'
@@ -2820,6 +2846,11 @@ EOF
         REALITY_SNI="${REALITY_SNI:-$REALITY_PUBLIC_SNI_DEFAULT}"
         REALITY_DEST="${REALITY_DEST:-$REALITY_PUBLIC_DEST_DEFAULT}"
         REALITY_DEST_PORT="${REALITY_DEST_PORT:-$REALITY_PUBLIC_PORT_DEFAULT}"
+        # keep 下降级只改了 state 与摘要：config.json 的 Reality 握手目标不会跟着变，
+        # 必须明示这个错位窗口，否则用户以为「降级完成 = 配置已同步」。
+        if [[ ${RERUN_MODE:-} == keep ]] && has_existing_deployment; then
+            warn "沿用旧配置下模块 7 只更新了 state.env 与摘要：config.json 的 Reality 握手目标仍是旧值，重跑模块 8 后才会按新目标重写配置"
+        fi
         if [[ -n $DOMAIN && -z $CF_TOKEN ]]; then
             warn "已提供域名 ${DOMAIN}，但缺少 CF Token 且本机没有可复用的同域名证书 → 回退公共站点握手"
         fi
@@ -4097,6 +4128,8 @@ m_genconfig() {
         return 1
     fi
     ok "sing-box 运行中"
+    # 配置已按新凭据写入并通过校验、服务已起：分叉解除（含跨进程遗留的旧标记）
+    SB_STATE_AHEAD=0
     save_state
 }
 
@@ -4269,6 +4302,11 @@ m_summary() {
     # build_node_tags / node_prefix（机房识别要联网查询，交互模式下还可能再次询问）。
     # 渲染输出以单个换行结尾，命令替换剥离后用 %s\n 补回，字节与直接落盘一致。
     local outbounds_render; outbounds_render="$(render_client_outbounds)"
+    # 落盘前先配平自检：outbounds 没有服务端渲染那条 sing-box check / python 解析兜底，
+    # 状态文件被手工塞进特殊字符时产出的坏 JSON 会被原样交付给客户端 ——
+    # 宁可在这里 fail-fast，也不交一份粘进客户端就报错的配置。
+    json_balance_ok "$outbounds_render" \
+        || die "客户端 outbounds 渲染结果未通过 JSON 配平自检（疑似特殊字符污染），已中止交付"
     {
         hr
         printf '  VPS 开荒配置摘要   生成时间: %s\n' "$(date -Is)"
@@ -4385,10 +4423,15 @@ m_summary() {
             && printf '  v6 节点策略：%s（--nat-v6-services）\n' \
                 "$([[ ${NAT_V6_SERVICES} == ssh-only ]] && echo '端口只供 SSH，不生成 v6 代理节点' || echo "仅保留 ${NAT_V6_SERVICES}")"
         printf '  用法：粘进客户端配置的 outbounds 数组；若客户端还没有 direct/block，请自行补上\n'
+        printf '  客户端版本：JSON 里 hy2 的 certificate_public_key_sha256 字段需较新 sing-box（≥ 1.13）；\n'
+        printf '             旧版客户端请改用上方分享链接（自带 pinSHA256 / insecure 校验信息）\n'
         printf '%s\n' "$outbounds_render"
         hr
     } | tee_600 "$info_out"
     if [[ $keep_mode -eq 1 ]]; then
+        # 跨进程分叉警示：上次轮换半失败（state 已是新凭据、config.json 未更新）
+        # 后用户重跑 keep，必须在这里看到提醒，而不是等模块 7/8 失败才发现
+        warn_state_config_divergence
         ok "沿用旧配置：vps-init.info / client-outbounds.json 保持原样，未重写；state.env 未改动"
         return 0
     fi
@@ -4433,10 +4476,15 @@ vless_link_for() { # <index>
 }
 hy2_link_for() { # <index>
     local i="$1" hop="" tlsarg=""
-    # v6 全开放的 NAT 机：只有 v6 链接带 mport，v4 链接仍连固定外部单端口
+    # v6 全开放的 NAT 机：只有 v6 链接带跳跃段，v4 链接仍连固定外部单端口
     # 变量名不要用 hr —— 那会遮蔽全局的分隔线函数 hr()
     local _hr; _hr="$(hop_range_for_ip "${NODE_IPS[$i]}")"
-    [[ -n $_hr ]] && hop="&mport=${_hr/:/-}"
+    # 官方 Hysteria2 URI 规范：端口跳跃写在 authority（多段逗号分隔、范围用连字符）
+    # —— sing-box / 官方客户端只认这里，只带 &mport= 的链接在官方客户端会丢失跳跃。
+    # mport= 是 NekoBox 等第三方客户端沿用至今的历史写法；query 参数对官方客户端
+    # 无害（未知参数被忽略），两个都给以兼容两类客户端。
+    local _auth_ports; _auth_ports="$(client_port_for hy2 "${NODE_IPS[$i]}")"
+    [[ -n $_hr ]] && { _auth_ports="${_auth_ports},${_hr/:/-}"; hop="&mport=${_hr/:/-}"; }
     # 服务端是自签证书：链接必须携带校验信息，否则客户端会因证书不受信任而握手失败。
     # 注意用的是「证书指纹 CERT_SHA256（hex）」，不是 JSON 里的公钥哈希 CERT_HASH ——
     # Hysteria2 URI 的 pinSHA256 口径是整张证书的 sha256（openssl x509 -fingerprint -sha256），
@@ -4448,7 +4496,7 @@ hy2_link_for() { # <index>
     fi
     printf 'hysteria2://%s@%s:%s/?sni=%s%s&alpn=h3&obfs=salamander&obfs-password=%s%s#%s' \
         "$(urlenc "$HY2_PW")" "$(link_host "$(client_host_for "${NODE_IPS[$i]}")")" \
-        "$(client_port_for hy2 "${NODE_IPS[$i]}")" "$CERT_CN" "$hop" \
+        "$_auth_ports" "$CERT_CN" "$hop" \
         "$(urlenc "$OBFS_PW")" "$tlsarg" "$(urlenc "${T_HY2[$i]}")"
 }
 
@@ -4493,6 +4541,8 @@ show_manage_status() { # 「只做管理」模式下的只读状态视图：不�
 }
 show_status() {
     [[ ${MANAGE_ONLY:-0} -eq 1 ]] && { show_manage_status; return 0; }
+    # 状态/配置分叉（上次轮换半失败）跨进程提醒：--status 是用户排查的第一入口
+    warn_state_config_divergence
     hr; printf '  当前配置状态（只读，不修改任何东西）\n'; hr
     if [[ -f $STATE_FILE ]]; then
         info "状态文件：$STATE_FILE"
@@ -4797,7 +4847,11 @@ cmd_doctor() {
 
     # ---- 7. 客户端域名解析 ----
     dinfo "[7/7] 客户端域名解析"
-    if ! command -v getent >/dev/null 2>&1; then
+    # --no-client-domain（FORCE_IP=1）下客户端 server 一律用裸 IP：域名解析比对
+    # 不会反映真实连接，检查整段跳过，否则「显式关了域名却拿域名去体检」自相矛盾。
+    if [[ ${CLIENT_DOMAIN_FORCE_IP:-0} -eq 1 ]]; then
+        dchk ok "域名解析" "已用 --no-client-domain 显式回到裸 IP，跳过域名比对"
+    elif ! command -v getent >/dev/null 2>&1; then
         dchk warn "域名解析" "本机无 getent，跳过（可手动 dig 确认 A / AAAA 记录）"
     elif [[ ${#NODE_IPS[@]} -eq 0 ]]; then
         dchk warn "域名解析" "未探测到本机公网地址，无法比对（可用 --ips 显式指定后重跑）"
@@ -6063,7 +6117,8 @@ ips_from_args() {
     NODE_IPS=()
     split_ip_list "$IP_LIST"
     NODE_IPS=("${SPLIT_IPS[@]}")
-    if [[ ${#NODE_IPS[@]} -eq 0 && -n ${IP:-} ]]; then NODE_IPS=("$IP"); fi
+    # IP= 环境变量与 --ips 同语义：支持逗号分隔清单，不能整串塞进一个元素
+    if [[ ${#NODE_IPS[@]} -eq 0 && -n ${IP:-} ]]; then split_ip_list "$IP"; NODE_IPS=("${SPLIT_IPS[@]}"); fi
     if [[ ${#NODE_IPS[@]} -eq 0 ]]; then NODE_IPS=("203.0.113.10"); fi
 }
 # 只读体检 / 机器可读状态用：**绝不能**拿占位地址冒充"本机真实 IP"。
@@ -6075,7 +6130,7 @@ real_ips_from_args() {
     NODE_IPS=()
     split_ip_list "$IP_LIST"
     NODE_IPS=("${SPLIT_IPS[@]}")
-    if [[ ${#NODE_IPS[@]} -eq 0 && -n ${IP:-} ]]; then NODE_IPS=("$IP"); fi
+    if [[ ${#NODE_IPS[@]} -eq 0 && -n ${IP:-} ]]; then split_ip_list "$IP"; NODE_IPS=("${SPLIT_IPS[@]}"); fi
     if [[ ${#NODE_IPS[@]} -eq 0 ]]; then
         # detect_ips 会打印探测提示；全部导到 stderr —— --json 模式下 stdout 必须只含 JSON
         detect_ips >&2 2>/dev/null || true

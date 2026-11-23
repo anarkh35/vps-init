@@ -66,6 +66,11 @@ echo "=========== T3 端口跳跃 mport 与单端口 ==========="
 HOP_RANGE="30000:50000"
 h3="$(hy2_link_for 0)"
 chk "mport 冒号转连字符" '1' "$([[ $h3 == *'&mport=30000-50000'* ]] && echo 1 || echo 0)"
+chk "authority 携带官方跳跃段（16407,30000-50000）" '1' \
+    "$([[ $h3 == *'@'*':16407,30000-50000/'* ]] && echo 1 || echo 0)"
+chk "单端口链接 authority 不含逗号跳跃段" '1' \
+    "$( HOP_RANGE=''; l="$(hy2_link_for 0)"; \
+        [[ $l == *':16407/'* && $l != *':16407,'* ]] && echo 1 || echo 0 )"
 
 echo
 echo "=========== T4 is_private_addr 边界 ==========="
@@ -896,6 +901,11 @@ chk "NAT 键与普通键同给时两条告警齐发" '1' \
         _out="$(warn_rerun_params_ignored 2>&1)"; RERUN_MODE=''; \
         [[ $_out == *'不会写入配置文件'* && $_out == *'CERT_CN'* \
            && $_out == *'实时生效'* && $_out == *'NAT_PORTS'* ]] && echo 1 || echo 0 )"
+chk "keep 下降级时明示 config.json 未同步（防三方错位）" '1' \
+    "$( declare -f m_reality | grep -qF '重跑模块 8 后才会按新目标重写配置' && echo 1 || echo 0 )"
+chk "SB_STATE_AHEAD 已持久化（跨进程分叉警示）" '1' \
+    "$( [[ " ${STATE_KEYS[*]} " == *' SB_STATE_AHEAD '* ]] && \
+        declare -f m_genconfig | grep -qF 'SB_STATE_AHEAD=0' && echo 1 || echo 0 )"
 chk "写路径有实例互斥锁（flock）" '1' \
     "$( declare -f acquire_instance_lock | grep -qF 'flock' && \
         declare -f main | grep -qF 'acquire_instance_lock' && echo 1 || echo 0 )"
