@@ -439,8 +439,15 @@ v4 / v6 节点、更不会把 selector 的 `default` 指向它。按推荐度排
   直接按「沿用旧配置」处理。
 - 选了「沿用旧配置」却又传了 `--ips` / `--vless-port` 等影响 `config.json` 的参数时，
   脚本会明确告警这些参数**不会写入配置**，并按 `state.env` 现值恢复（含 `--domain` /
-  `--reality-*` / `--tcp-keep-alive*` / `--hop-interval*`：否则模块 7 会用新域名重写
-  Caddyfile、模块 9 会把线上不存在的参数打到终端，造出三方不一致）；要生效请改选「生成新配置」。
+  `--reality-*` / `--tcp-keep-alive*` / `--hop-interval*` / 端口三件套 `--vless-port` /
+  `--hy2-port` / `--fallback-port` / `--hop-range`：否则模块 3 会按新端口下发防火墙、
+  模块 7 会用新域名重写 Caddyfile、模块 9 会把线上不存在的参数打到终端，造出三方不一致）；
+  要生效请改选「生成新配置」。
+- **例外：NAT 参数不在恢复链里**。keep 时携带 `--nat-*` 系列参数仍会实时生效
+  （模块 3 按新映射下发防火墙规则）并写入 `state.env`，脚本会单独告警这一点；
+  要让部署按旧参数原样保留，请不要在 keep 时携带 NAT 参数，或直接改选「生成新配置」。
+- keep 恢复按 `state.env` 实际存在的键执行：旧版本状态文件缺键时保留命令行值不动
+  （不会把参数清成空串），并照常打印恢复告警。
 - 选了「生成新配置」但没包含模块 6（如 `--modules 8,9`），会告警「只重渲染配置、不轮换凭据」。
 - **实例互斥**：写路径（部署 / `--rotate-secrets` / `--uninstall`）运行期间会在
   `~/.vps-init/.instance.lock` 上加 `flock` 独占锁，第二个实例会直接拒绝启动；
@@ -576,7 +583,7 @@ bash vps-init.sh --print-outbounds    # 客户端 outbounds
 | `--tcp-keep-alive D` / `--tcp-keep-alive-int D` | 客户端 TCP 保活时长与探测间隔（默认 `2m` / `30s`） |
 | `--sb-version V` | 锁定 sing-box 安装版本 tag（默认装官方最新版） |
 | `--sb-bandwidth U:D` | **服务端** hy2 限速（上下行 Mbps，如 `200:500`；严格两段、仅一个冒号，三段值会被拒绝）；留空不限制 |
-| `--doctor` | 只读体检：服务 / 监听端口 / 配置校验 / 防火墙关键规则 / **证书与指纹** / 客户端域名解析 / NAT 端口清单一次看完，详见「跑完之后」 |
+| `--doctor` | 只读体检：**状态与凭据** / 服务 / 配置校验 / 监听端口 / 证书与指纹 / 防火墙关键规则（含 v4 / v6 分族的跳跃 DNAT；v6 侧缺失按提示降级）/ 客户端域名解析 / NAT 端口清单一次看完，详见「跑完之后」 |
 | `--json` | 与 `--status` / `--doctor` 搭配：输出机器可读 JSON（stdout 只含 JSON，NAT 端口清单等文本输出在 JSON 模式下自动关闭），供面板、批量管理工具或脚本解析；凭据只报存在性布尔，绝不含明文；`--status --json` 读取前先校验 state.env，被手工改坏时明确报错而不是产出解析失败的 JSON |
 | `--rotate-secrets` | 快速换钥匙：只轮换 UUID / short_id / hy2 密码 / obfs 密码并重写服务端配置与客户端交付、重启 sing-box（Reality 密钥与自签证书不变，pinSHA256 无需更新）；现有客户端全部作废，需重新导入。仅跑模块 6/8/9，比完整重跑快得多；与 `--modules` 同时给时以 6/8/9 为准（会提示覆盖），避免「提示在轮换、实际一个凭据都没动」；与 `--keep-config` 互斥（轮换必须重写配置，显式报错不静默覆盖） |
 | `--uninstall` | 干净下线代理：停用并移除 sing-box、删除 `/etc/sing-box` 与 `/root` 交付文件（含凭据明文）、**拆除本脚本部署的 Caddy 回落站**（其证书就在 `/etc/sing-box` 里，不拆会留下起不来的 Caddy；用户自建的 Caddy 站点自动识别、不碰）、清除代理端口防火墙规则与跳跃 DNAT（先复核 SSH 放行仍在位）；保留 SSH 加固 / fail2ban / tcpfit；state.env 默认保留供日后重部署，加 `--purge-state` 一并删除 |

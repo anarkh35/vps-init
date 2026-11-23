@@ -676,7 +676,7 @@ usage() {
   --yes                 非交互，全部模块按默认值执行
                         重跑时若未指定上面任一模式，一律按「沿用旧配置」处理（绝不自动覆盖）
   --print-config        仅渲染服务端 sing-box 配置到 stdout
-  --print-outbounds     仅渲染客户端 outbounds 到 stdout（可配 --ips / IP=1.2.3.4）
+  --print-outbounds     仅渲染客户端 outbounds 到 stdout（可配 --ips，或 IP=1.2.3.4 环境变量）
   --status              查看当前机器配置状态（不修改任何东西）
   --doctor              一键体检（只读）：服务 / 配置校验 / 监听端口 / 防火墙关键规则 /
                         证书与指纹 / 客户端域名解析 / NAT 端口清单；有异常时退出码 1
@@ -1327,7 +1327,12 @@ while [[ $# -gt 0 ]]; do
         --status) SHOW_STATUS=1; shift;;
         --doctor) DOCTOR=1; shift;;
         --json) STATUS_JSON=1; DOCTOR_JSON=1; shift;;
-        --rotate-secrets) ROTATE_SECRETS=1; MODULES_ARG="6,8,9"; RERUN_MODE=new; shift;;
+        --rotate-secrets)
+            ROTATE_SECRETS=1; MODULES_ARG="6,8,9"
+            # 环境变量 RERUN_MODE=keep 会与新配置模式静默冲突：轮换必须重写 config.json，
+            # keep 语义在此不成立 —— 必须留痕，不能无声覆盖用户显式给出的 keep。
+            [[ ${RERUN_MODE:-} == keep ]] && warn "环境变量 RERUN_MODE=keep 与 --rotate-secrets 冲突：轮换必须重写配置，已按「生成新配置」处理"
+            RERUN_MODE=new; shift;;
         --uninstall) UNINSTALL=1; shift;;
         --purge-state) PURGE_STATE=1; shift;;
         --self-test) SELF_TEST=1; shift;;
@@ -1522,16 +1527,19 @@ restore_client_domain_for_keep() {
     # 与 restore_credentials_for_keep 同策略：以 state.env 为准恢复四个域名键。
     [[ ${RERUN_MODE:-} == keep ]] || return 0
     [[ -f $STATE_FILE ]] || return 0
-    local k line v
+    local k line v _found
     for k in CLIENT_DOMAIN CLIENT_DOMAIN_V4 CLIENT_DOMAIN_V6 CLIENT_DOMAIN_FORCE_IP; do
         [[ -n ${CLI_SET[$k]:-} ]] || continue
-        v=""
+        v=""; _found=0
         while IFS= read -r line; do
             [[ $line == "$k="* ]] || continue
-            v="${line#*=}"; v="${v#\"}"; v="${v%\"}"; v="$(state_unescape "$v")"; break
+            v="${line#*=}"; v="${v#\"}"; v="${v%\"}"; v="$(state_unescape "$v")"; _found=1; break
         done < "$STATE_FILE"
-        printf -v "$k" '%s' "$v"
-        unset "CLI_SET[$k]"
+        # state 缺键（旧版本状态文件）时保留 CLI 值不动：把空串写回去会静默清掉用户参数
+        if [[ $_found -eq 1 ]]; then
+            printf -v "$k" '%s' "$v"
+            unset "CLI_SET[$k]"
+        fi
     done
     return 0
 }
@@ -1547,16 +1555,20 @@ restore_server_params_for_keep() {
     # 但模块 3 防火墙 / 模块 9 分享链接会拿新端口下发 —— 新端口对外放行、旧端口才在监听，
     # 节点静默不可达（Reality 的 fallback-port 甚至会直接打断回落握手）。
     for k in DOMAIN VLESS_PORT HY2_PORT FALLBACK_PORT REALITY_SNI REALITY_DEST REALITY_DEST_PORT \
-             TCP_KEEP_ALIVE TCP_KEEP_ALIVE_INTERVAL HOP_INTERVAL HOP_INTERVAL_MAX; do
+             TCP_KEEP_ALIVE TCP_KEEP_ALIVE_INTERVAL HOP_INTERVAL HOP_INTERVAL_MAX HOP_RANGE; do
         [[ -n ${CLI_SET[$k]:-} ]] || continue
-        v=""
+        v=""; _found=0
         while IFS= read -r line; do
             [[ $line == "$k="* ]] || continue
-            v="${line#*=}"; v="${v#\"}"; v="${v%\"}"; v="$(state_unescape "$v")"; break
+            v="${line#*=}"; v="${v#\"}"; v="${v%\"}"; v="$(state_unescape "$v")"; _found=1; break
         done < "$STATE_FILE"
-        printf -v "$k" '%s' "$v"
-        unset "CLI_SET[$k]"
-        _touched+=" ${k}"
+        # state 缺键（旧版本状态文件）时保留 CLI 值不动：把空串写回去会静默清掉用户参数，
+        # 而端口被清空后 need_port 的报错还指向 state，让人白查一轮。
+        if [[ $_found -eq 1 ]]; then
+            printf -v "$k" '%s' "$v"
+            unset "CLI_SET[$k]"
+            _touched+=" ${k}"
+        fi
     done
     if [[ -n $_touched ]]; then
         warn "选择了「沿用旧配置」，命令行参数（${_touched# }）已忽略：以 ${STATE_FILE} 现值为准，避免状态文件 / config.json / Caddyfile 三者不一致"
@@ -1624,18 +1636,32 @@ rerun_choice_needed() { # 本次是否会触及凭据 / config.json（模块 6 �
 warn_rerun_params_ignored() { # keep 下 CLI 新参数不会写进配置，必须讲清楚
     [[ ${RERUN_MODE:-} == keep ]] || return 0
     local k _ign=""
-    for k in IP_LIST VLESS_PORT HY2_PORT FALLBACK_PORT HOP_RANGE UP_MBPS DOWN_MBPS \
-             SB_UP_MBPS SB_DOWN_MBPS CERT_CN UUID NAT_MODE \
+    # 端口三件套 / HOP_RANGE / DOMAIN 组 / 域名组 / UUID 已被 keep 恢复链真正打回
+    # （见 restore_server_params_for_keep / restore_client_domain_for_keep /
+    #   restore_credentials_for_keep），这里的「忽略」名单必须与恢复链严格一致。
+    for k in IP_LIST UP_MBPS DOWN_MBPS \
+             SB_UP_MBPS SB_DOWN_MBPS CERT_CN \
              DOMAIN REALITY_SNI REALITY_DEST REALITY_DEST_PORT \
              TCP_KEEP_ALIVE TCP_KEEP_ALIVE_INTERVAL HOP_INTERVAL HOP_INTERVAL_MAX \
-             CLIENT_DOMAIN CLIENT_DOMAIN_V4 CLIENT_DOMAIN_V6 CLIENT_DOMAIN_FORCE_IP \
-             NAT_PORTS NAT_MAP NAT_V4_OPEN NAT_V6_OPEN \
-             NAT_V6_PORTS NAT_V6_MAP NAT_V4_SERVICES NAT_V6_SERVICES; do
+             CLIENT_DOMAIN CLIENT_DOMAIN_V4 CLIENT_DOMAIN_V6 CLIENT_DOMAIN_FORCE_IP; do
         [[ -n ${CLI_SET[$k]:-} ]] && _ign+=" ${k}"
     done
-    [[ -n $_ign ]] || return 0
-    warn "本次命令行指定了会影响 config.json / 客户端 outbounds 的参数（${_ign# }），但选择了「沿用旧配置」：这些参数不会写入配置文件"
-    warn "若要让新参数生效，请改用「生成新配置」（--new-config）"
+    # NAT 组没有恢复链：keep 下仍会实时生效（模块 3 按新映射下发防火墙规则）并落盘，
+    # 绝不能混进上面「不会写入」的名单 —— 否则告警与实际行为相反。
+    # 注意两条告警相互独立：只带 NAT 参数（_ign 为空）时也要能看到本警示。
+    local _nat_live=""
+    for k in NAT_MODE NAT_PORTS NAT_MAP NAT_V4_OPEN NAT_V6_OPEN \
+             NAT_V6_PORTS NAT_V6_MAP NAT_V4_SERVICES NAT_V6_SERVICES; do
+        [[ -n ${CLI_SET[$k]:-} ]] && _nat_live+=" ${k}"
+    done
+    if [[ -n $_ign ]]; then
+        warn "本次命令行指定了会影响 config.json / 客户端 outbounds 的参数（${_ign# }），但选择了「沿用旧配置」：这些参数不会写入配置文件"
+        warn "若要让新参数生效，请改用「生成新配置」（--new-config）"
+    fi
+    if [[ -n $_nat_live ]]; then
+        warn "注意：NAT 参数（${_nat_live# }）在「沿用旧配置」下仍会实时生效（模块 3 防火墙按新映射下发）并写入状态文件；要让部署按旧参数原样保留，请不要在 keep 时携带 NAT 参数，或改用 --new-config"
+    fi
+    [[ -n $_ign || -n $_nat_live ]] || return 0
 }
 warn_incomplete_credentials() { # keep 下若状态文件残缺，明确告知而不是静默跳过
     [[ ${RERUN_MODE:-} == keep ]] || return 0
@@ -2248,7 +2274,7 @@ m_firewall() {
         # 历史跳跃规则清扫：换范围 / --no-hop / 族由全开放转受限后，旧的整段放行
         # 与 DNAT 不会自动消失（ipt_add 的 -C 按完整参数匹配，换参数只会追加新规则），
         # 残留规则会继续把 UDP 段转发到已无人监听的端口 —— 必须在追加新规则前删掉。
-        local _hop_keep=0 _hop_line _hop_r _hop_d
+        local _hop_keep=0 _hop_line _hop_r _hop_d _hop_cleaned=""
         [[ -n ${HOP_RANGE:-} && $hop_fw -eq 1 && $proxy_ok -eq 1 ]] && _hop_keep=1
         while IFS= read -r _hop_line; do
             [[ $_hop_line == *'--dport '*'-j ACCEPT' ]] || continue
@@ -2256,6 +2282,7 @@ m_firewall() {
             [[ $_hop_r == *:* ]] || continue
             if [[ $_hop_keep -eq 1 && $_hop_r == "$HOP_RANGE" ]]; then continue; fi
             ipt_un "$fw" INPUT -p udp --dport "$_hop_r" -j ACCEPT
+            _hop_cleaned+=" INPUT/${_hop_r}"
         done < <("$fw" -S INPUT 2>/dev/null | grep -E -- '--dport [0-9]+:[0-9]+ .*-j ACCEPT' || true)
         while IFS= read -r _hop_line; do
             [[ $_hop_line == *'--dport '*'-j DNAT'* ]] || continue
@@ -2264,7 +2291,11 @@ m_firewall() {
             [[ $_hop_r == *:* && -n $_hop_d ]] || continue
             if [[ $_hop_keep -eq 1 && $_hop_r == "$HOP_RANGE" && $_hop_d == "$HY2_PORT" ]]; then continue; fi
             ipt_un "$fw" -t nat PREROUTING -p udp --dport "$_hop_r" -j DNAT --to-destination ":$_hop_d"
+            _hop_cleaned+=" DNAT/${_hop_r}→:${_hop_d}"
         done < <("$fw" -t nat -S PREROUTING 2>/dev/null | grep -E -- '--dport [0-9]+:[0-9]+ .*-j DNAT' || true)
+        # 删除必须留痕：同形规则也可能是用户自建的转发（比如手动给某个 UDP 段做过 DNAT），
+        # 静默删掉会让用户排查无门 —— 告警里给出确切规则，可手动恢复。
+        [[ -z $_hop_cleaned ]] || warn "${fw} 清扫了非当前配置的整段 UDP 跳跃规则:${_hop_cleaned}（若是自行添加的规则，请手动恢复；当前生效范围见交付摘要）"
         # HOP_RANGE 为空（--no-hop）时必须跳过，否则会拼出 "-p udp --dport -j ACCEPT" 的非法规则
         if [[ -n $HOP_RANGE && $hop_fw -eq 1 && $proxy_ok -eq 1 ]]; then
             ipt_head "$fw" INPUT -p udp --dport "$HOP_RANGE" -j ACCEPT
@@ -4062,6 +4093,7 @@ m_genconfig() {
         # 与渲染/校验失败不同，此时 keep 重跑反而能按新配置校验并启动。
         err "sing-box 未启动，日志：journalctl -u sing-box -e"
         warn "config.json 已更新为新凭据但服务未运行：修复后重跑选「沿用旧配置」即可按新配置校验并启动"
+        warn "交付文件（vps-init.info / client-outbounds.json）仍是旧凭据（模块 9 未执行）；若放弃新配置回滚 config.json，旧交付文件恰好有效，若保留新配置请重跑 --modules 9 刷新"
         return 1
     fi
     ok "sing-box 运行中"
@@ -4925,12 +4957,20 @@ cmd_status_json() {
 ipt_un() { # ipt_un <iptables-cmd> <args...>  规则存在才删除，幂等
     # -C 只判"存在"，-D 只删第一条。历史重跑（或镜像自带同名规则）可能留下多条，
     # 只删一次会残留，卸载后规则依旧生效 —— 这里循环删到 -C 不再匹配为止。
+    # 删除失败/超限计入全局 IPT_UN_FAIL（调用方如 --uninstall 据实汇报），自身仍返回 0
+    # （m_firewall 的降级语义是"只告警不中断"，返回值变化会被 set -e 放大成中断）。
     local cmd="$1"; shift
     local n=0
+    IPT_UN_FAIL="${IPT_UN_FAIL:-0}"
     while "$cmd" -C "$@" 2>/dev/null; do
-        "$cmd" -D "$@" 2>/dev/null || { warn "规则删除失败（请手动清理）: $cmd -D $*"; break; }
-        n=$((n+1))
-        (( n < 32 )) || { warn "规则重复过多（>32 条），已停止清理: $cmd $*"; break; }
+        if "$cmd" -D "$@" 2>/dev/null; then
+            n=$((n+1))
+        else
+            warn "规则删除失败（请手动清理）: $cmd -D $*"
+            IPT_UN_FAIL=$((IPT_UN_FAIL+1))
+            break
+        fi
+        (( n < 32 )) || { warn "规则重复过多（>32 条），已停止清理: $cmd $*"; IPT_UN_FAIL=$((IPT_UN_FAIL+1)); break; }
     done
     return 0
 }
@@ -5064,6 +5104,8 @@ cmd_uninstall() {
     if command -v netfilter-persistent >/dev/null 2>&1; then
         netfilter-persistent save >/dev/null 2>&1 && ok "防火墙规则已持久化（重启后同样生效）" \
             || warn "netfilter-persistent save 失败：重启后已删规则可能回来，请手动检查"
+    else
+        info "本机无 netfilter-persistent：无开机恢复的规则集，已删规则重启后不会回来"
     fi
     # 删除规则后立刻复核 SSH 放行仍然在位（绝不能因为卸载把管理通道拆掉）
     local _chk _chk_fw _miss_p _miss=0
@@ -5086,6 +5128,12 @@ cmd_uninstall() {
     fi
 
     hr
+    # 收尾必须据实：删除失败 / SSH 复核缺失时报出未竟项并以非零退出，
+    # 否则「卸载完成」与实际残留状态矛盾。
+    if [[ ${IPT_UN_FAIL:-0} -gt 0 || $_miss -gt 0 ]]; then
+        err "卸载未完全成功：${IPT_UN_FAIL:-0} 条规则删除失败 / SSH 放行复核 ${_miss} 处缺失，请按上方告警手动处理"
+        return 1
+    fi
     ok "卸载完成：sing-box / 配置 / 证书 / 回落站 / 交付文件 / 代理防火墙规则已清除"
     printf '  保留组件：SSH 加固、fail2ban、tcpfit；caddy 程序本体保留（不再需要: apt-get purge caddy）。\n'
     printf '  INPUT 默认策略保持 DROP（更安全）；如需恢复 ACCEPT 请手动执行：iptables -P INPUT ACCEPT\n'
@@ -6116,6 +6164,9 @@ main() {
     # 留下「拆到一半」的状态（配置删了、规则还在），比不执行更危险。
     if [[ ${UNINSTALL:-0} -eq 1 ]]; then
         [[ $EUID -eq 0 ]] || die "请以 root 身份运行 --uninstall（sudo -i 后执行）"
+        # 卸载同样是写路径：ERR trap（意外失败不能裸退出，留下「拆到一半」的状态）
+        # 与实例互斥锁同样适用 —— 与下方模块流程同策略。
+        trap 'rc=$?; err "卸载在第 ${LINENO} 行出错（退出码 ${rc}）。已完成步骤不会自动回滚，请查看上方输出后重跑 --uninstall 补齐。"; exit $rc' ERR
         acquire_instance_lock
         parse_nat_map "$NAT_MAP"; parse_nat_map6 "$NAT_V6_MAP"; detect_nat
         cmd_uninstall; exit $?

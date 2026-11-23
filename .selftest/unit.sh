@@ -860,10 +860,42 @@ chk "非 keep 模式恢复函数不动 CLI 新值" 'new.example.com' \
         RERUN_MODE=new; DOMAIN='new.example.com'; declare -A CLI_SET=([DOMAIN]=1); \
         restore_server_params_for_keep >/dev/null 2>&1; _r="$DOMAIN"; \
         rm -rf "$STATE_DIR"; RERUN_MODE=''; printf '%s' "$_r" )"
+chk "keep 恢复：state 缺键时保留 CLI 值（不清成空串）" '9000' \
+    "$( _t21_env; STATE_DIR="$SELF/state-srv-keep4"; STATE_FILE="$STATE_DIR/state.env"; \
+        rm -rf "$STATE_DIR"; mkdir -p "$STATE_DIR"; \
+        printf 'DOMAIN="old.example.com"\n' > "$STATE_FILE"; \
+        RERUN_MODE=keep; VLESS_PORT='9000'; declare -A CLI_SET=([VLESS_PORT]=1 [DOMAIN]=1); \
+        restore_server_params_for_keep >/dev/null 2>&1; _r="$VLESS_PORT"; \
+        rm -rf "$STATE_DIR"; RERUN_MODE=''; printf '%s' "$_r" )"
+chk "keep 恢复：state 缺键时不清 CLI_SET 标记（不算已忽略）" '1' \
+    "$( _t21_env; STATE_DIR="$SELF/state-srv-keep5"; STATE_FILE="$STATE_DIR/state.env"; \
+        rm -rf "$STATE_DIR"; mkdir -p "$STATE_DIR"; \
+        printf 'DOMAIN="old.example.com"\n' > "$STATE_FILE"; \
+        RERUN_MODE=keep; VLESS_PORT='9000'; declare -A CLI_SET=([VLESS_PORT]=1); \
+        restore_server_params_for_keep >/dev/null 2>&1; \
+        _r="$( [[ -n ${CLI_SET[VLESS_PORT]:-} ]] && echo 1 || echo 0 )"; \
+        rm -rf "$STATE_DIR"; RERUN_MODE=''; printf '%s' "$_r" )"
+chk "keep 恢复链覆盖 HOP_RANGE（跳跃范围一并打回）" '30000:40000' \
+    "$( _t21_env; STATE_DIR="$SELF/state-srv-keep6"; STATE_FILE="$STATE_DIR/state.env"; \
+        rm -rf "$STATE_DIR"; mkdir -p "$STATE_DIR"; \
+        printf 'HOP_RANGE="30000:40000"\n' > "$STATE_FILE"; \
+        RERUN_MODE=keep; HOP_RANGE='31000:41000'; declare -A CLI_SET=([HOP_RANGE]=1); \
+        restore_server_params_for_keep >/dev/null 2>&1; _r="$HOP_RANGE"; \
+        rm -rf "$STATE_DIR"; RERUN_MODE=''; printf '%s' "$_r" )"
 chk "warn_rerun_params_ignored 覆盖 DOMAIN / 保活 / 跳跃间隔键" '1' \
     "$( declare -f warn_rerun_params_ignored | grep -qF 'DOMAIN REALITY_SNI' && \
         declare -f warn_rerun_params_ignored | grep -qF 'TCP_KEEP_ALIVE' && \
         declare -f warn_rerun_params_ignored | grep -qF 'HOP_INTERVAL_MAX' && echo 1 || echo 0 )"
+chk "NAT 键不在「被忽略」名单而在「实时生效」警示里" '1' \
+    "$( _t21_env; RERUN_MODE=keep; declare -A CLI_SET=([NAT_PORTS]=1); \
+        _out="$(warn_rerun_params_ignored 2>&1)"; RERUN_MODE=''; \
+        [[ $_out == *'实时生效'* && $_out == *'NAT_PORTS'* \
+           && $_out != *'不会写入配置文件'* ]] && echo 1 || echo 0 )"
+chk "NAT 键与普通键同给时两条告警齐发" '1' \
+    "$( _t21_env; RERUN_MODE=keep; declare -A CLI_SET=([NAT_PORTS]=1 [CERT_CN]=1); \
+        _out="$(warn_rerun_params_ignored 2>&1)"; RERUN_MODE=''; \
+        [[ $_out == *'不会写入配置文件'* && $_out == *'CERT_CN'* \
+           && $_out == *'实时生效'* && $_out == *'NAT_PORTS'* ]] && echo 1 || echo 0 )"
 chk "写路径有实例互斥锁（flock）" '1' \
     "$( declare -f acquire_instance_lock | grep -qF 'flock' && \
         declare -f main | grep -qF 'acquire_instance_lock' && echo 1 || echo 0 )"
