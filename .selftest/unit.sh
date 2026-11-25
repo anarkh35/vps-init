@@ -982,6 +982,38 @@ chk "脚本里没有夹在续行中间的注释行" '0' \
 chk "SSH 端口校验统一走 is_port（无内联数字正则）" '0' \
     "$(grep -c 'SSH_PORT =~ \^\[0-9\]' "$_SRC" || true)"
 
+# ---- T26 Round N：帮助文本对齐 / SSH 放行复核 / caddy 源形状校验 / doctor v6 nat 能力 ----
+# -y 短选项一直在 cmd_parse 里支持（--yes|-y），但帮助与文档都没写 —— 文档与实现不一致。
+chk "usage 列出 -y 短选项（与 cmd_parse 一致）" '1' \
+    "$( awk '/usage\(\)/,/^}/' "$_SRC" | grep -c -- '--yes, -y' )"
+# --acme-ca 实际接受 letsencrypt_test/zerossl/buypass/google/sslcom 及 http(s) 地址
+# （校验分支 1178 行写明了），帮助只写「可选 zerossl」会让用户以为别的都非法。
+chk "usage --acme-ca 写明 http(s) 地址写法" '1' \
+    "$( awk '/usage\(\)/,/^}/' "$_SRC" | grep -c 'acme.sh --server' )"
+# RERUN_MODE 环境变量写法 overview.md 参数表有、帮助没有，帮助补齐对齐。
+chk "usage --config-mode 提及 RERUN_MODE 环境变量" '1' \
+    "$( awk '/usage\(\)/,/^}/' "$_SRC" | grep -c 'RERUN_MODE=keep|new' )"
+# SSH 放行规则插入后必须复核：插入失败被 || true 吞掉而默认策略 DROP 时会锁死登录。
+chk "m_ssh 插入 SSH 放行规则后有复核与告警" '1' \
+    "$( declare -f m_ssh | grep -c 'SSH 放行规则未生效' )"
+chk "m_ssh 不再裸吞 iptables -I 失败（旧写法 -I ... || true 已移除）" '0' \
+    "$( declare -f m_ssh | grep -c '\-I INPUT 1 -p tcp --dport "\$p" -j ACCEPT || true' )"
+# caddy apt 源内容形状校验：CDN 故障页写进 keyring/sources.list.d 会污染后续 apt 操作。
+chk "m_reality 校验 caddy 公钥形状（BEGIN PGP PUBLIC KEY BLOCK）" '1' \
+    "$( declare -f m_reality | grep -c 'BEGIN PGP PUBLIC KEY BLOCK' )"
+chk "m_reality 校验 caddy 源含 deb 行" '1' \
+    "$( declare -f m_reality | grep -cE "grep -qE .*deb " )"
+chk "caddy 安装失败时回滚 apt 源与公钥" '1' \
+    "$( declare -f m_reality | grep -c '回滚新增的 apt 源与公钥' )"
+# doctor v6 跳跃 DNAT 检查以 nat 表查询成功为准：ip6tables 存在但内核无 ip6table_nat
+# 时查询失败，不应把 v6 DNAT 报成「缺失」。
+chk "cmd_doctor 用 _nat6_ok 门控 v6 跳跃 DNAT 检查" '1' \
+    "$( declare -f cmd_doctor | grep -c '\[\[ \$_nat6_ok -eq 1 \]\] && _doct_hop_v6=1' )"
+chk "cmd_doctor 不再仅凭 ip6tables 命令存在就要求 v6 DNAT" '0' \
+    "$( declare -f cmd_doctor | grep -c 'command -v ip6tables >/dev/null 2>&1 && _doct_hop_v6=1' )"
+chk "cmd_doctor 捕获 _nat6 查询成功标志" '1' \
+    "$( declare -f cmd_doctor | grep -c '_nat6_ok=1' )"
+
 echo
 echo "================================================"
 printf '通过 %d 项，失败 %d 项\n' "$pass" "$fail"

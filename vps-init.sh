@@ -675,15 +675,18 @@ usage() {
   --tcp-bw N            本机带宽（Mbps），仅用于打印可复制的 tcpfit 调优命令
   --uuid UUID           固定 UUID（仅首次部署生效；重跑选任一模式都不会使用这个固定值）
   --sb-version VER      安装指定版本 sing-box（留空装最新；该选择不写状态文件，重跑需重新指定）
-  --acme-ca NAME        证书颁发机构，默认 letsencrypt（可选 zerossl）
+  --acme-ca NAME        证书颁发机构，默认 letsencrypt；可选 letsencrypt_test / zerossl /
+                        buypass / buypass_test / google / googletest / sslcom，
+                        或直接给 CA 的 http(s) 地址（原样传给 acme.sh --server）
   --modules LIST        只执行指定模块，如 1,2,3
   --keep-config         重跑二选一之「沿用旧配置」：完整保留 config.json 与全部密码/密钥/证书，
                         不覆盖、不改动、不重启服务；已下发的客户端继续可用
   --new-config          重跑二选一之「生成新配置」：每次重新生成一整套 UUID / Reality 密钥 /
                         short_id / 各密码 / 自签证书并更新 config.json，旧客户端全部作废
   --config-mode keep|new
-                        上面两个开关的带值写法；非法值直接报错退出
-  --yes                 非交互，全部模块按默认值执行
+                        上面两个开关的带值写法；非法值直接报错退出。
+                        也可用环境变量 RERUN_MODE=keep|new（优先级低于显式参数）
+  --yes, -y             非交互，全部模块按默认值执行（-y 是 --yes 的短写法）
                         重跑时若未指定上面任一模式，一律按「沿用旧配置」处理（绝不自动覆盖）
   --print-config        仅渲染服务端 sing-box 配置到 stdout
   --print-outbounds     仅渲染客户端 outbounds 到 stdout（可配 --ips，或 IP=1.2.3.4 环境变量）
@@ -2161,8 +2164,14 @@ EOF
             else command -v ip6tables >/dev/null || continue; fw=ip6tables; fi
             while read -r p; do
                 [[ -n $p ]] || continue
-                "$fw" -C INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null \
-                    || "$fw" -I INPUT 1 -p tcp --dport "$p" -j ACCEPT || true
+                if ! "$fw" -C INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null; then
+                    "$fw" -I INPUT 1 -p tcp --dport "$p" -j ACCEPT 2>/dev/null || true
+                fi
+                # 插入后必须复核：插入失败被吞（权限/表满/桩异常）而默认策略是 DROP 时，
+                # 改完 SSH 端口重启 sshd 就是直接锁死 —— 这里宁可吵也不可哑
+                if ! "$fw" -C INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null; then
+                    warn "SSH 放行规则未生效（${fw} --dport ${p}）：若默认策略为 DROP，改端口后可能无法登录，请立即手工放行"
+                fi
             done < <(ssh_ports_for_family "$fam")
         done
         # 新端口规则必须落盘：若本机此前持久化过 INPUT DROP，而这次新增的放行没存下来，
@@ -2708,8 +2717,19 @@ m_reality() {
             local caddy_repo="$CACHE_DIR/caddy-stable.list"
             fetch_file "$caddy_key" 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
                 || die "caddy 仓库公钥下载失败，无法添加 apt 源"
+            # 内容形状校验：CDN/代理故障时可能返回 HTML 错误页，一旦被写进 keyring /
+            # sources.list.d，后续每次 apt 操作都会被坏源污染。校验失败顺带清掉缓存，
+            # 否则下次重跑会命中同一份坏缓存、永远卡死在同一步。
+            if ! grep -q 'BEGIN PGP PUBLIC KEY BLOCK' "$caddy_key" 2>/dev/null; then
+                rm -f "$caddy_key"
+                die "caddy 仓库公钥内容异常（不含 GPG 公钥块，疑似下载到了错误页），已清理缓存中止；请检查网络后重跑"
+            fi
             fetch_file "$caddy_repo" 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
                 || die "caddy 仓库地址下载失败，无法添加 apt 源"
+            if ! grep -qE '^[[:space:]]*deb ' "$caddy_repo" 2>/dev/null; then
+                rm -f "$caddy_repo"
+                die "caddy 仓库地址内容异常（不含 deb 源行，疑似下载到了错误页），已清理缓存中止；请检查网络后重跑"
+            fi
             mkdir -p /usr/share/keyrings /etc/apt/sources.list.d
             # --batch --yes：keyring 已存在时（上次在本步之后失败）gpg 会交互询问覆盖，
             # 而 stdin 已被重定向为 key 文件 —— 非交互下必然报错，重跑永远过不去
@@ -2720,7 +2740,13 @@ m_reality() {
             # 紧接着 apt-get install caddy 直接报 "Unable to locate package"（全量运行必现）
             APT_UPDATED=0
             apt_update
-            apt_install caddy
+            # 安装失败时回滚新增源与公钥：apt_install 会 die，用子壳捕获，
+            # 留半成品源在 sources.list.d 里会让后续每次 apt 操作都报错
+            if ! ( apt_install caddy ); then
+                rm -f /etc/apt/sources.list.d/caddy-stable.list \
+                    /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+                die "caddy 安装失败，已回滚新增的 apt 源与公钥（避免坏源污染后续 apt 操作）"
+            fi
         fi
 
         if [[ $reuse_cert -eq 1 ]]; then
@@ -4788,12 +4814,17 @@ cmd_doctor() {
     else
         # 规则集先整体捕获再匹配：grep -q 命中即退出会让上游 iptables 吃 SIGPIPE（141），
         # pipefail 下整条管道判假 —— 规则明明在位却被报成「未设 / 未放行」（假阴性）
-        local _in4 _in6 _nat4 _nat6=""
+        local _in4 _in6 _nat4 _nat6="" _nat6_ok=0
         _in4="$(iptables -S INPUT 2>/dev/null || true)"
         _in6="$(ip6tables -S INPUT 2>/dev/null || true)"
         _nat4="$(iptables -t nat -S PREROUTING 2>/dev/null || true)"
-        if command -v ip6tables >/dev/null 2>&1; then
-            _nat6="$(ip6tables -t nat -S PREROUTING 2>/dev/null || true)"
+        # v6 nat 表要真正查询成功才算「具备 IPv6 NAT 能力」：ip6tables 命令存在
+        # 但内核没加载 ip6table_nat 时查询会失败，此时不应把 v6 DNAT 报成「缺失」
+        if command -v ip6tables >/dev/null 2>&1 \
+            && _nat6="$(ip6tables -t nat -S PREROUTING 2>/dev/null)"; then
+            _nat6_ok=1
+        else
+            _nat6=""
         fi
         if [[ $_in4 == *'-P INPUT DROP'* ]]; then
             dchk ok "iptables INPUT 默认 DROP"
@@ -4826,7 +4857,7 @@ cmd_doctor() {
                 [[ ${NAT_V6_OPEN:-0} -eq 1 ]] && _doct_hop_v6=1
             else
                 _doct_hop_v4=1
-                command -v ip6tables >/dev/null 2>&1 && _doct_hop_v6=1
+                [[ $_nat6_ok -eq 1 ]] && _doct_hop_v6=1
             fi
             if [[ $_doct_hop_v4 -eq 1 ]]; then
                 if [[ $_nat4 == *"--to-destination :${HY2_PORT}"* ]]; then

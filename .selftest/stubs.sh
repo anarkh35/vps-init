@@ -203,6 +203,16 @@ for a in "$@"; do
 done
 case "$url" in
     *ipify.org*|*ip.sb*) printf '1.2.3.4\n'; exit 0;;
+    # caddy 仓库公钥 / apt 源要给形状校验吃（Round N 起拒绝 HTML 错误页）：
+    # 桩载荷必须是真实形状，否则 verify.sh D 段会在校验处 die、caddy 安装不再执行
+    *gpg.key*)
+        [[ -n $out ]] && { mkdir -p "$(dirname "$out")"
+            printf -- '-----BEGIN PGP PUBLIC KEY BLOCK-----\n# stub gpg payload\n-----END PGP PUBLIC KEY BLOCK-----\n' > "$out"; }
+        exit 0;;
+    *debian.deb.txt*)
+        [[ -n $out ]] && { mkdir -p "$(dirname "$out")"
+            printf '# stub apt source\ndeb [signed-by=/usr/share/keyrings/caddy-stable-archive-keyring.gpg] https://dl.cloudsmith.io/public/caddy/stable/debian/debian any-version main\n' > "$out"; }
+        exit 0;;
 esac
 if [[ -n $out ]]; then
     mkdir -p "$(dirname "$out")"

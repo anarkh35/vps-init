@@ -547,7 +547,7 @@ bash vps-init.sh --print-outbounds    # 客户端 outbounds
 | `--client-domain-v4 HOST` / `--no-client-domain-v4` | 只给 v4 节点用的独立域名（优先于共用域名）/ 清除该覆盖 |
 | `--client-domain-v6 HOST` / `--no-client-domain-v6` | 只给 v6 节点用的独立域名（共用域名只有 A 记录时必备）/ 清除该覆盖 |
 | `--cf-token TOKEN` | Cloudflare API Token（DNS-01 签发证书）。**不写状态文件**；重跑若已有同域名证书则无需再给 |
-| `--acme-email MAIL` / `--acme-ca NAME` | acme.sh 注册邮箱（默认 `admin@<domain>`）/ CA（默认 letsencrypt） |
+| `--acme-email MAIL` / `--acme-ca NAME` | acme.sh 注册邮箱（默认 `admin@<domain>`）/ CA（默认 letsencrypt；可选 letsencrypt_test / zerossl / buypass / buypass_test / google / googletest / sslcom，或 CA 的 http(s) 地址，原样传给 acme.sh --server） |
 | `--reality-sni HOST` | 公共站点握手 SNI（默认 `www.microsoft.com`；本地回落时自动用 `--domain`） |
 | `--reality-dest HOST` | 公共站点握手目标（默认 `www.microsoft.com`；本地回落时自动用 `127.0.0.1`） |
 | `--reality-dest-port N` | 公共站点握手端口（默认 443；本地回落时自动用 `--fallback-port`） |
@@ -558,7 +558,7 @@ bash vps-init.sh --print-outbounds    # 客户端 outbounds
 | `--new-config` | 重跑二选一之**生成新配置**：每次重新生成全套凭据并更新 `config.json`，旧客户端全部作废 |
 | `--config-mode keep\|new` | 上面两个开关的带值写法；非法值直接报错退出。也可用环境变量 `RERUN_MODE=keep\|new` |
 | `--modules LIST` | 只执行指定模块，如 `1,2,3` |
-| `--yes` | 非交互，全部模块按默认值执行。**重跑时未指定模式一律按「沿用旧配置」处理**，绝不自动覆盖 |
+| `--yes`（短写 `-y`） | 非交互，全部模块按默认值执行。**重跑时未指定模式一律按「沿用旧配置」处理**，绝不自动覆盖 |
 | `--ips LIST` | 手动指定 IP（逗号分隔），留空自动探测；写 `auto` 强制重新探测。离线渲染（`--print-outbounds`）不做 NAT 自动判定：给的 IP 全是私网地址且未带 `--nat` 参数时会在 stderr 提示（NAT 机请带 `--nat --nat-ports … --nat-map …`，否则节点用的是内部端口、连不上） |
 | `--node-name NAME` | 客户端 tag 前缀；留空则**自动识别机房城市**（如 `洛杉矶` → `洛杉矶 v4-vl`）。识别失败时真实终端上的交互部署会询问手动输入，结果存入 `state.env`；非交互用本参数指定 |
 | `--web-page PATH` | 自定义伪装站 `index.html`；留空则用内置的「青山·一屏山色」页面 |
