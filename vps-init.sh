@@ -474,16 +474,19 @@ cert_domain_matches() {
     # 因此这里必须 || true（与 §0 的同类管道处理保持一致）。
     cn="$(openssl x509 -in "$cert" -noout -subject -nameopt multiline 2>/dev/null \
         | sed -n 's/^[[:space:]]*commonName[[:space:]]*=[[:space:]]*//p' | head -n1 || true)"
-    if [[ $cn == "$domain" ]] \
-        || [[ $cn == '*.'* && $domain == *".${cn#*.}" ]]; then
+    # DNS 域名不区分大小写：证书里的 CN/SAN 可能是大写，直接字符串比对会误判不匹配
+    local _cn="${cn,,}" _d="${domain,,}"
+    if [[ $_cn == "$_d" ]] \
+        || [[ $_cn == '*.'* && $_d == *".${_cn#*.}" ]]; then
         return 0
     fi
 
     sans="$(openssl x509 -in "$cert" -noout -ext subjectAltName 2>/dev/null || true)"
     while IFS= read -r entry; do
         entry="${entry#DNS:}"
-        [[ $entry == "$domain" ]] && return 0
-        [[ $entry == '*.'* && $domain == *".${entry#*.}" ]] && return 0
+        entry="${entry,,}"
+        [[ $entry == "$_d" ]] && return 0
+        [[ $entry == '*.'* && $_d == *".${entry#*.}" ]] && return 0
     done < <(printf '%s\n' "$sans" | grep -oE 'DNS:[^,[:space:]]+' || true)
     return 1
 }
@@ -577,6 +580,21 @@ urlenc() {
     s="${s//+/%2B}"; s="${s//\//%2F}"; s="${s//=/%3D}"; s="${s// /%20}"
     s="${s//#/%23}"; s="${s//&/%26}"; s="${s//\?/%3F}"; s="${s//:/%3A}"
     s="${s//@/%40}"; s="${s//\"/%22}"; s="${s//$'\n'/%0A}"; s="${s//$'\r'/%0D}"
+    # 非 ASCII 字节（UTF-8 多字节字符，如默认的中文节点名）逐字节百分号编码：
+    # fragment 里留裸多字节字符时，部分客户端/剪贴板会按本地编码重新解释，链接易被弄坏。
+    # LC_ALL=C 让长度/下标按字节计，printf "'c" 取出的是字节值而非码点。
+    if [[ $s == *[![:ascii:]]* ]]; then
+        local i c o out="" LC_ALL=C
+        for (( i = 0; i < ${#s}; i++ )); do
+            c="${s:i:1}"
+            printf -v o '%d' "'$c"
+            if (( o > 127 )); then
+                printf -v c '%%%02X' "$o"
+            fi
+            out+="$c"
+        done
+        s="$out"
+    fi
     printf '%s' "$s"
 }
 
@@ -682,7 +700,8 @@ usage() {
                         或直接给 CA 的 http(s) 地址（原样传给 acme.sh --server）
   --modules LIST        只执行指定模块，如 1,2,3
   --keep-config         重跑二选一之「沿用旧配置」：完整保留 config.json 与全部密码/密钥/证书，
-                        不覆盖、不改动、不重启服务；已下发的客户端继续可用
+                        不覆盖、不改动、不重启 sing-box；已下发的客户端继续可用
+                        （Caddyfile / 伪装站等其它模块仍按所选模块正常维护）
   --new-config          重跑二选一之「生成新配置」：每次重新生成一整套 UUID / Reality 密钥 /
                         short_id / 各密码 / 自签证书并更新 config.json，旧客户端全部作废
   --config-mode keep|new
@@ -1239,148 +1258,159 @@ mark_cli() {
     return 0
 }
 
-while [[ $# -gt 0 ]]; do
-    # 裸 -- 是选项结束符：本脚本无位置参数，直接吞掉而不是抛「未知参数」或
-    # 让 mark_cli 拿空下标写 CLI_SET（bash 报 bad array subscript，脚本崩）
-    if [[ $1 == -- ]]; then shift; continue; fi
-    mark_cli "$1"
-    case "$1" in
-        --ssh-port) need_val "$@"; need_port "--ssh-port" "$2"; SSH_PORT="$2"; shift 2;;
-        --pubkey) need_val "$@"; PUBKEY="$2"; shift 2;;
-        --pubkey-file) need_val "$@"; PUBKEY_FILE="$2"; shift 2;;
-        --pubkey-url) need_val "$@"; PUBKEY_URL="$2"; shift 2;;
-        --domain) need_val "$@"; need_hostname "--domain" "$2"; DOMAIN="$2"; shift 2;;
-        --client-domain) need_val "$@"; need_client_domain "--client-domain" "$2"
-            CLIENT_DOMAIN="$2"; CLIENT_DOMAIN_FORCE_IP=0; shift 2;;
-        # v4 / v6 对称：两个分族域名都优先于共用域名，习惯分开就各给一个。
-        --client-domain-v4) need_val "$@"; need_client_domain "--client-domain-v4" "$2"
-            CLIENT_DOMAIN_V4="$2"; CLIENT_DOMAIN_FORCE_IP=0; shift 2;;
-        --no-client-domain-v4) CLIENT_DOMAIN_V4=""; shift;;
-        --client-domain-v6) need_val "$@"; need_client_domain "--client-domain-v6" "$2"
-            CLIENT_DOMAIN_V6="$2"; CLIENT_DOMAIN_FORCE_IP=0; shift 2;;
-        --no-client-domain-v6) CLIENT_DOMAIN_V6=""; shift;;
-        # 关闭域名模式要连两个分族专属域名一起清掉，否则状态文件里残留的域名
-        # 会在下次给 --client-domain 时又把节点偷偷改成另一个域名。
-        --no-client-domain)
-            CLIENT_DOMAIN=""; CLIENT_DOMAIN_V4=""; CLIENT_DOMAIN_V6=""
-            CLIENT_DOMAIN_FORCE_IP=1; shift;;
-        --cf-token) need_val "$@"; CF_TOKEN="$2"; shift 2;;
-        --acme-email) need_val "$@"; ACME_EMAIL="$2"; shift 2;;
-        --acme-ca) need_val "$@"; ACME_CA="$2"; shift 2;;
-        --reality-sni) need_val "$@"; need_hostname "--reality-sni" "$2"; REALITY_SNI="$2"; shift 2;;
-        --reality-dest) need_val "$@"; need_host "--reality-dest" "$2"; REALITY_DEST="$2"; shift 2;;
-        --reality-dest-port) need_val "$@"; need_port "--reality-dest-port" "$2"; REALITY_DEST_PORT="$2"; shift 2;;
-        --cert-cn) need_val "$@"; need_hostname "--cert-cn" "$2"; CERT_CN="$2"; shift 2;;
-        --web-page) need_val "$@"; WEB_PAGE="$2"; shift 2;;
-        --vless-port) need_val "$@"; need_port "--vless-port" "$2"; VLESS_PORT="$2"; shift 2;;
-        --hy2-port) need_val "$@"; need_port "--hy2-port" "$2"; HY2_PORT="$2"; shift 2;;
-        --fallback-port) need_val "$@"; need_port "--fallback-port" "$2"; FALLBACK_PORT="$2"; shift 2;;
-        --hop-range) need_val "$@"; HOP_RANGE="$2"; need_hop_range; shift 2;;
-        --no-hop) HOP_RANGE=""; shift;;
-        --ips) need_val "$@"
-            # auto = 显式放弃状态文件里的旧 IP 列表，回到自动探测
-            # （mark_cli 已把 IP_LIST 记为"命令行指定过"，因此置空不会被 load_state 回填）
-            if [[ $2 == auto ]]; then IP_LIST=""; else IP_LIST="$2"; fi
-            shift 2;;
-        --bind-all) BIND_ALL=1; shift;;
-        --nat) NAT_MODE=force; shift;;
-        --no-nat) NAT_MODE=off; shift;;
-        --nat-ports) need_val "$@"; need_nat_ports "$2" "--nat-ports"; NAT_PORTS="$2"; shift 2;;
-        --nat-map) need_val "$@"; parse_nat_map "$2"; NAT_MAP="$2"; shift 2;;
-        --nat-v4-open) NAT_V4_OPEN=1; shift;;
-        --no-nat-v4-open) NAT_V4_OPEN=0; shift;;
-        --nat-v6-open) NAT_V6_OPEN=1; shift;;
-        --no-nat-v6-open) NAT_V6_OPEN=0; shift;;
-        --nat-v6-ports) need_val "$@"; need_nat_ports "$2" "--nat-v6-ports"; NAT_V6_PORTS="$2"; shift 2;;
-        --nat-v6-map) need_val "$@"; parse_nat_map6 "$2"; NAT_V6_MAP="$2"; shift 2;;
-        --nat-v4-services) need_val "$@"; need_nat_v4_services "$2"
-            # 校验时剥离了空格，存值也必须剥离：否则 "vless, hy2" 会被下游按
-            # 字面量比对（",hy2," 匹配不到），节点静默少一半
-            NAT_V4_SERVICES="${2// /}"; NAT_V4_SERVICES="${NAT_V4_SERVICES,,}"; shift 2;;
-        --nat-v6-services) need_val "$@"; need_nat_v6_services "$2"
-            NAT_V6_SERVICES="${2// /}"; NAT_V6_SERVICES="${NAT_V6_SERVICES,,}"; shift 2;;
-        --nat-wizard) NAT_WIZARD=on; shift;;
-        --no-nat-wizard) NAT_WIZARD=off; shift;;
-        --manage-only) MANAGE_ONLY=1; shift;;
-        --no-manage-only) MANAGE_ONLY=0; shift;;
-        --up-mbps) need_val "$@"; need_posint "--up-mbps" "$2"; UP_MBPS="$2"; shift 2;;
-        --down-mbps) need_val "$@"; need_posint "--down-mbps" "$2"; DOWN_MBPS="$2"; shift 2;;
-        --hop-interval) need_val "$@"; need_duration "--hop-interval" "$2"; HOP_INTERVAL="$2"; shift 2;;
-        --hop-interval-max) need_val "$@"; need_duration "--hop-interval-max" "$2"; HOP_INTERVAL_MAX="$2"; shift 2;;
-        --tcp-keep-alive) need_val "$@"; need_duration "--tcp-keep-alive" "$2"; TCP_KEEP_ALIVE="$2"; shift 2;;
-        --tcp-keep-alive-int) need_val "$@"; need_duration "--tcp-keep-alive-int" "$2"; TCP_KEEP_ALIVE_INTERVAL="$2"; shift 2;;
-        --sb-bandwidth) need_val "$@"
-            # 严格两段校验：一个冒号、两侧均为正整数。"200:500:100" 这类三段值
-            # 若放行会被 %%: / ##: 静默解析成 200:100，限速悄悄打折。
-            [[ $2 =~ ^[1-9][0-9]*:[1-9][0-9]*$ ]] \
-                || die "--sb-bandwidth 格式应为 上行:下行（两个正整数，仅一个冒号），如 200:500（收到: $2）"
-            SB_UP_MBPS="${2%%:*}"; SB_DOWN_MBPS="${2##*:}"
-            shift 2;;
-        --node-name) need_val "$@"; NODE_NAME="$2"; shift 2;;
-        --shaper-rate) need_val "$@"; is_rate "$2" || die "--shaper-rate 非法：应为 Mbps 数字，如 1000（收到: $2）"; SHAPER_RATE="$2"; shift 2;;
-        --tcp-bw) need_val "$@"
-            [[ $2 =~ ^[1-9][0-9]*$ ]] \
-                || die "--tcp-bw 非法：应为正整数（Mbps），如 1000（收到: $2）"
-            TCP_BW="$2"; shift 2;;
-        --uuid) need_val "$@"; is_uuid "$2" || die "--uuid 非法：需为标准 UUID（收到: $2）"; UUID="$2"; shift 2;;
-        --keep-config|--new-config)
-            _rm_v="keep"; [[ $1 == --new-config ]] && _rm_v="new"
-            [[ -z $RERUN_MODE_CLI || $RERUN_MODE_CLI == "$_rm_v" ]] \
-                || die "选项冲突：--keep-config（沿用旧配置）与 --new-config（生成新配置）只能选一个"
-            RERUN_MODE_CLI="$_rm_v"; RERUN_MODE="$_rm_v"; shift;;
-        --config-mode) need_val "$@"
-            _rm_v=""
-            case "${2,,}" in
-                keep|1|old|reuse|沿用旧配置)   _rm_v="keep";;
-                new|2|regen|rotate|生成新配置) _rm_v="new";;
-                *) die "--config-mode 非法：只能是 keep（沿用旧配置）或 new（生成新配置），收到: $2";;
-            esac
-            [[ -z $RERUN_MODE_CLI || $RERUN_MODE_CLI == "$_rm_v" ]] \
-                || die "选项冲突：已指定 --config-mode ${RERUN_MODE_CLI}，不能再指定 ${_rm_v}"
-            RERUN_MODE_CLI="$_rm_v"; RERUN_MODE="$_rm_v"; shift 2;;
-        --sb-version) need_val "$@"; SB_VERSION="$2"; shift 2;;
-        --modules) need_val "$@"; MODULES_ARG="$2"; shift 2;;
-        --yes|-y) ASSUME_YES=1; shift;;
-        --print-config) PRINT_CONFIG=1; shift;;
-        --print-outbounds) PRINT_OUTBOUNDS=1; shift;;
-        --status) SHOW_STATUS=1; shift;;
-        --doctor) DOCTOR=1; shift;;
-        --json) STATUS_JSON=1; DOCTOR_JSON=1; shift;;
-        --rotate-secrets)
-            ROTATE_SECRETS=1; MODULES_ARG="6,8,9"
-            # 环境变量 RERUN_MODE=keep 会与新配置模式静默冲突：轮换必须重写 config.json，
-            # keep 语义在此不成立 —— 必须留痕，不能无声覆盖用户显式给出的 keep。
-            [[ ${RERUN_MODE:-} == keep ]] && warn "环境变量 RERUN_MODE=keep 与 --rotate-secrets 冲突：轮换必须重写配置，已按「生成新配置」处理"
-            RERUN_MODE=new; shift;;
-        --uninstall) UNINSTALL=1; shift;;
-        --purge-state) PURGE_STATE=1; shift;;
-        --self-test) SELF_TEST=1; shift;;
-        -h|--help) usage; exit 0;;
-        *) err "未知参数: $1"; usage; exit 1;;
-    esac
-done
+# 命令行解析抽成函数：直接执行时由文件末尾的守卫调用；被 source 载入时只加载
+# 定义、不碰调用方 $@ —— 顶层跑循环的 shift 会吃掉调用方位置参数，「未知参数」
+# 分支的 exit 还会终止调用方脚本。测试探针（verify.sh）source 后显式调用
+# parse_cli_args "$@" 即可获得与直接执行完全一致的解析与解析后校正。
+parse_cli_args() {
 
-# --rotate-secrets 的语义是「必须走到模块 6 才有凭据可换」。如果同一命令行里
-# --modules 把它盖掉（例如 --rotate-secrets --modules 1），就会出现
-# 「提示正在轮换、实际一个凭据都没动，还报告成功」的假成功，这里统一拉回。
-if [[ ${ROTATE_SECRETS:-0} -eq 1 ]]; then
-    # 轮换的本质是「生成新凭据 + 重写配置」，与「沿用旧配置」互斥。
-    # 用户显式给了 --keep-config 时，把 RERUN_MODE 悄悄改成 new 违背其明确意图 —— 报错而非覆盖。
-    if [[ ${RERUN_MODE_CLI:-} == keep ]]; then
-        die "--rotate-secrets 与 --keep-config 冲突：轮换必须重写 config.json 与客户端交付，请去掉 --keep-config（或改用 --new-config）"
-    fi
-    if [[ -n ${MODULES_ARG:-} && ${MODULES_ARG// /} != "6,8,9" ]]; then
-        warn "--rotate-secrets 只跑模块 6/8/9，本次 --modules ${MODULES_ARG} 已被覆盖（轮换必须包含凭据生成与渲染）"
-    fi
-    MODULES_ARG="6,8,9"
-    RERUN_MODE=new
-fi
+    while [[ $# -gt 0 ]]; do
+        # 裸 -- 是选项结束符：本脚本无位置参数，直接吞掉而不是抛「未知参数」或
+        # 让 mark_cli 拿空下标写 CLI_SET（bash 报 bad array subscript，脚本崩）
+        if [[ $1 == -- ]]; then shift; continue; fi
+        mark_cli "$1"
+        case "$1" in
+            --ssh-port) need_val "$@"; need_port "--ssh-port" "$2"; SSH_PORT="$2"; shift 2;;
+            --pubkey) need_val "$@"; PUBKEY="$2"; shift 2;;
+            --pubkey-file) need_val "$@"; PUBKEY_FILE="$2"; shift 2;;
+            --pubkey-url) need_val "$@"; PUBKEY_URL="$2"; shift 2;;
+            --domain) need_val "$@"; need_hostname "--domain" "$2"; DOMAIN="$2"; shift 2;;
+            --client-domain) need_val "$@"; need_client_domain "--client-domain" "$2"
+                CLIENT_DOMAIN="$2"; CLIENT_DOMAIN_FORCE_IP=0; shift 2;;
+            # v4 / v6 对称：两个分族域名都优先于共用域名，习惯分开就各给一个。
+            --client-domain-v4) need_val "$@"; need_client_domain "--client-domain-v4" "$2"
+                CLIENT_DOMAIN_V4="$2"; CLIENT_DOMAIN_FORCE_IP=0; shift 2;;
+            --no-client-domain-v4) CLIENT_DOMAIN_V4=""; shift;;
+            --client-domain-v6) need_val "$@"; need_client_domain "--client-domain-v6" "$2"
+                CLIENT_DOMAIN_V6="$2"; CLIENT_DOMAIN_FORCE_IP=0; shift 2;;
+            --no-client-domain-v6) CLIENT_DOMAIN_V6=""; shift;;
+            # 关闭域名模式要连两个分族专属域名一起清掉，否则状态文件里残留的域名
+            # 会在下次给 --client-domain 时又把节点偷偷改成另一个域名。
+            --no-client-domain)
+                CLIENT_DOMAIN=""; CLIENT_DOMAIN_V4=""; CLIENT_DOMAIN_V6=""
+                CLIENT_DOMAIN_FORCE_IP=1; shift;;
+            --cf-token) need_val "$@"; CF_TOKEN="$2"; shift 2;;
+            --acme-email) need_val "$@"; ACME_EMAIL="$2"; shift 2;;
+            --acme-ca) need_val "$@"; ACME_CA="$2"; shift 2;;
+            --reality-sni) need_val "$@"; need_hostname "--reality-sni" "$2"; REALITY_SNI="$2"; shift 2;;
+            --reality-dest) need_val "$@"; need_host "--reality-dest" "$2"; REALITY_DEST="$2"; shift 2;;
+            --reality-dest-port) need_val "$@"; need_port "--reality-dest-port" "$2"; REALITY_DEST_PORT="$2"; shift 2;;
+            --cert-cn) need_val "$@"; need_hostname "--cert-cn" "$2"; CERT_CN="$2"; shift 2;;
+            --web-page) need_val "$@"; WEB_PAGE="$2"; shift 2;;
+            --vless-port) need_val "$@"; need_port "--vless-port" "$2"; VLESS_PORT="$2"; shift 2;;
+            --hy2-port) need_val "$@"; need_port "--hy2-port" "$2"; HY2_PORT="$2"; shift 2;;
+            --fallback-port) need_val "$@"; need_port "--fallback-port" "$2"; FALLBACK_PORT="$2"; shift 2;;
+            --hop-range) need_val "$@"; HOP_RANGE="$2"; need_hop_range; shift 2;;
+            --no-hop) HOP_RANGE=""; shift;;
+            --ips) need_val "$@"
+                # auto = 显式放弃状态文件里的旧 IP 列表，回到自动探测
+                # （mark_cli 已把 IP_LIST 记为"命令行指定过"，因此置空不会被 load_state 回填）
+                if [[ $2 == auto ]]; then IP_LIST=""; else IP_LIST="$2"; fi
+                shift 2;;
+            --bind-all) BIND_ALL=1; shift;;
+            --nat) NAT_MODE=force; shift;;
+            --no-nat) NAT_MODE=off; shift;;
+            --nat-ports) need_val "$@"; need_nat_ports "$2" "--nat-ports"; NAT_PORTS="$2"; shift 2;;
+            --nat-map) need_val "$@"; parse_nat_map "$2"; NAT_MAP="$2"; shift 2;;
+            --nat-v4-open) NAT_V4_OPEN=1; shift;;
+            --no-nat-v4-open) NAT_V4_OPEN=0; shift;;
+            --nat-v6-open) NAT_V6_OPEN=1; shift;;
+            --no-nat-v6-open) NAT_V6_OPEN=0; shift;;
+            --nat-v6-ports) need_val "$@"; need_nat_ports "$2" "--nat-v6-ports"; NAT_V6_PORTS="$2"; shift 2;;
+            --nat-v6-map) need_val "$@"; parse_nat_map6 "$2"; NAT_V6_MAP="$2"; shift 2;;
+            --nat-v4-services) need_val "$@"; need_nat_v4_services "$2"
+                # 校验时剥离了空格，存值也必须剥离：否则 "vless, hy2" 会被下游按
+                # 字面量比对（",hy2," 匹配不到），节点静默少一半
+                NAT_V4_SERVICES="${2// /}"; NAT_V4_SERVICES="${NAT_V4_SERVICES,,}"; shift 2;;
+            --nat-v6-services) need_val "$@"; need_nat_v6_services "$2"
+                NAT_V6_SERVICES="${2// /}"; NAT_V6_SERVICES="${NAT_V6_SERVICES,,}"; shift 2;;
+            --nat-wizard) NAT_WIZARD=on; shift;;
+            --no-nat-wizard) NAT_WIZARD=off; shift;;
+            --manage-only) MANAGE_ONLY=1; shift;;
+            --no-manage-only) MANAGE_ONLY=0; shift;;
+            --up-mbps) need_val "$@"; need_posint "--up-mbps" "$2"; UP_MBPS="$2"; shift 2;;
+            --down-mbps) need_val "$@"; need_posint "--down-mbps" "$2"; DOWN_MBPS="$2"; shift 2;;
+            --hop-interval) need_val "$@"; need_duration "--hop-interval" "$2"; HOP_INTERVAL="$2"; shift 2;;
+            --hop-interval-max) need_val "$@"; need_duration "--hop-interval-max" "$2"; HOP_INTERVAL_MAX="$2"; shift 2;;
+            --tcp-keep-alive) need_val "$@"; need_duration "--tcp-keep-alive" "$2"; TCP_KEEP_ALIVE="$2"; shift 2;;
+            --tcp-keep-alive-int) need_val "$@"; need_duration "--tcp-keep-alive-int" "$2"; TCP_KEEP_ALIVE_INTERVAL="$2"; shift 2;;
+            --sb-bandwidth) need_val "$@"
+                # 严格两段校验：一个冒号、两侧均为正整数。"200:500:100" 这类三段值
+                # 若放行会被 %%: / ##: 静默解析成 200:100，限速悄悄打折。
+                [[ $2 =~ ^[1-9][0-9]*:[1-9][0-9]*$ ]] \
+                    || die "--sb-bandwidth 格式应为 上行:下行（两个正整数，仅一个冒号），如 200:500（收到: $2）"
+                SB_UP_MBPS="${2%%:*}"; SB_DOWN_MBPS="${2##*:}"
+                shift 2;;
+            --node-name) need_val "$@"; NODE_NAME="$2"; shift 2;;
+            --shaper-rate) need_val "$@"; is_rate "$2" || die "--shaper-rate 非法：应为 Mbps 数字，如 1000（收到: $2）"; SHAPER_RATE="$2"; shift 2;;
+            --tcp-bw) need_val "$@"
+                [[ $2 =~ ^[1-9][0-9]*$ ]] \
+                    || die "--tcp-bw 非法：应为正整数（Mbps），如 1000（收到: $2）"
+                TCP_BW="$2"; shift 2;;
+            --uuid) need_val "$@"; is_uuid "$2" || die "--uuid 非法：需为标准 UUID（收到: $2）"; UUID="$2"; shift 2;;
+            --keep-config|--new-config)
+                _rm_v="keep"; [[ $1 == --new-config ]] && _rm_v="new"
+                [[ -z $RERUN_MODE_CLI || $RERUN_MODE_CLI == "$_rm_v" ]] \
+                    || die "选项冲突：--keep-config（沿用旧配置）与 --new-config（生成新配置）只能选一个"
+                RERUN_MODE_CLI="$_rm_v"; RERUN_MODE="$_rm_v"; shift;;
+            --config-mode) need_val "$@"
+                _rm_v=""
+                case "${2,,}" in
+                    keep|1|old|reuse|沿用旧配置)   _rm_v="keep";;
+                    new|2|regen|rotate|生成新配置) _rm_v="new";;
+                    *) die "--config-mode 非法：只能是 keep（沿用旧配置）或 new（生成新配置），收到: $2";;
+                esac
+                [[ -z $RERUN_MODE_CLI || $RERUN_MODE_CLI == "$_rm_v" ]] \
+                    || die "选项冲突：已指定 --config-mode ${RERUN_MODE_CLI}，不能再指定 ${_rm_v}"
+                RERUN_MODE_CLI="$_rm_v"; RERUN_MODE="$_rm_v"; shift 2;;
+            --sb-version) need_val "$@"; SB_VERSION="$2"; shift 2;;
+            --modules) need_val "$@"; MODULES_ARG="$2"; shift 2;;
+            --yes|-y) ASSUME_YES=1; shift;;
+            --print-config) PRINT_CONFIG=1; shift;;
+            --print-outbounds) PRINT_OUTBOUNDS=1; shift;;
+            --status) SHOW_STATUS=1; shift;;
+            --doctor) DOCTOR=1; shift;;
+            --json) STATUS_JSON=1; DOCTOR_JSON=1; shift;;
+            --rotate-secrets)
+                ROTATE_SECRETS=1; MODULES_ARG="6,8,9"
+                # 环境变量 RERUN_MODE=keep 会与新配置模式静默冲突：轮换必须重写 config.json，
+                # keep 语义在此不成立 —— 必须留痕，不能无声覆盖用户显式给出的 keep。
+                [[ ${RERUN_MODE:-} == keep ]] && warn "环境变量 RERUN_MODE=keep 与 --rotate-secrets 冲突：轮换必须重写配置，已按「生成新配置」处理"
+                RERUN_MODE=new; shift;;
+            --uninstall) UNINSTALL=1; shift;;
+            --purge-state) PURGE_STATE=1; shift;;
+            --self-test) SELF_TEST=1; shift;;
+            -h|--help) usage; exit 0;;
+            *) err "未知参数: $1"; usage; exit 1;;
+        esac
+    done
 
-# --purge-state 只是 --uninstall 的修饰符：单独出现时什么都不会发生。
-# 提示在解析后立即给出：若后面 preflight 因缺依赖 / 非 root 直接 die，
-# 这里的提示是用户能看到的唯一线索（否则会误以为 state.env 已经被删了）。
-if [[ ${PURGE_STATE:-0} -eq 1 && ${UNINSTALL:-0} -ne 1 ]]; then
-    warn "--purge-state 只与 --uninstall 搭配生效；本次没有 --uninstall，该参数被忽略（state.env 未删除）"
+    # --rotate-secrets 的语义是「必须走到模块 6 才有凭据可换」。如果同一命令行里
+    # --modules 把它盖掉（例如 --rotate-secrets --modules 1），就会出现
+    # 「提示正在轮换、实际一个凭据都没动，还报告成功」的假成功，这里统一拉回。
+    if [[ ${ROTATE_SECRETS:-0} -eq 1 ]]; then
+        # 轮换的本质是「生成新凭据 + 重写配置」，与「沿用旧配置」互斥。
+        # 用户显式给了 --keep-config 时，把 RERUN_MODE 悄悄改成 new 违背其明确意图 —— 报错而非覆盖。
+        if [[ ${RERUN_MODE_CLI:-} == keep ]]; then
+            die "--rotate-secrets 与 --keep-config 冲突：轮换必须重写 config.json 与客户端交付，请去掉 --keep-config（或改用 --new-config）"
+        fi
+        if [[ -n ${MODULES_ARG:-} && ${MODULES_ARG// /} != "6,8,9" ]]; then
+            warn "--rotate-secrets 只跑模块 6/8/9，本次 --modules ${MODULES_ARG} 已被覆盖（轮换必须包含凭据生成与渲染）"
+        fi
+        MODULES_ARG="6,8,9"
+        RERUN_MODE=new
+    fi
+
+    # --purge-state 只是 --uninstall 的修饰符：单独出现时什么都不会发生。
+    # 提示在解析后立即给出：若后面 preflight 因缺依赖 / 非 root 直接 die，
+    # 这里的提示是用户能看到的唯一线索（否则会误以为 state.env 已经被删了）。
+    if [[ ${PURGE_STATE:-0} -eq 1 && ${UNINSTALL:-0} -ne 1 ]]; then
+        warn "--purge-state 只与 --uninstall 搭配生效；本次没有 --uninstall，该参数被忽略（state.env 未删除）"
+    fi
+}
+
+if [[ -z ${BASH_SOURCE[0]:-} || ${BASH_SOURCE[0]} == "$0" ]]; then
+    parse_cli_args "$@"
 fi
 
 # ===== §8 状态存取 =====
@@ -1706,8 +1736,8 @@ print_rerun_choice() {
     printf '  %s检测到已有部署，请选择本次重跑方式（必须二选一）：%s\n' "$C_B" "$C_N"
     hr
     printf '   %s1) 沿用旧配置%s  —— 完整保留现有 config.json、UUID、Reality 密钥、各密码、\n' "$C_G" "$C_N"
-    printf '                        Hysteria2 自签证书与交付文件：不覆盖、不改动、不重启服务；\n'
-    printf '                        已下发的客户端配置与分享链接继续可用\n'
+    printf '                        Hysteria2 自签证书与交付文件：不覆盖、不改动、不重启 sing-box；\n'
+    printf '                        已下发的客户端配置与分享链接继续可用；Caddyfile 等仍按所选模块维护\n'
     printf '   %s2) 生成新配置%s  —— 每次都重新生成一整套新的 UUID、Reality 密钥、short_id、\n' "$C_Y" "$C_N"
     printf '                        各密码、自签证书与 pinSHA256，并更新 config.json 与交付文件；\n'
     printf '                        不复用固定值或上次生成结果；旧客户端配置与分享链接全部作废\n'
@@ -1795,7 +1825,7 @@ report_rerun() {
     fi
     if [[ ${RERUN_MODE:-} == keep ]]; then
         printf '  凭据      : 完整保留现有 UUID（%s…）/ Reality 密钥 / 各密码 / 自签证书\n' "${UUID:0:8}"
-        printf '  配置文件  : %s 与交付文件保持原样，不覆盖、不改动、不重启服务\n' "$SB_CONF"
+        printf '  配置文件  : %s 与交付文件保持原样，不覆盖、不改动、不重启 sing-box\n' "$SB_CONF"
         printf '  已下发客户端继续可用；想换一套全新凭据请显式加 --new-config\n'
     elif [[ ${MOD_ON[5]:-0} -eq 1 ]]; then
         if [[ ${ROTATE_SECRETS:-0} -eq 1 ]]; then
@@ -1817,7 +1847,7 @@ report_rerun() {
     printf '  端口      : SSH %s / vless %s / hy2 %s\n' "$SSH_PORT" "$VLESS_PORT" "$HY2_PORT"
     if [[ ${RERUN_MODE:-} == keep ]]; then
         printf '  sing-box  : %s、vps-init.info、client-outbounds.json 本次不改写\n' "$SB_CONF"
-        printf '  其它模块  : Caddyfile / 伪装站 index.html 等仍按所选模块正常维护\n'
+        printf '  其它模块  : Caddyfile / 伪装站 index.html 等仍按所选模块正常维护（可能重启 caddy）\n'
     else
         printf '  将被覆盖  : %s、Caddyfile、伪装站 index.html、vps-init.info、client-outbounds.json（仅限本次所选模块）\n' "$SB_CONF"
         printf '  配置文件覆盖前会留备份；要改某项请用对应 CLI 参数，或编辑 %s\n' "$STATE_FILE"
@@ -2530,6 +2560,12 @@ m_singbox() {
         local inst="$CACHE_DIR/sing-box-install.sh"
         fetch_file "$inst" https://sing-box.app/install.sh \
             || die "sing-box 安装脚本下载失败（可重跑本模块；缓存目录 ${CACHE_DIR}）"
+        # 形态校验：CDN/代理故障时可能下回 HTML 错误页，直接 sh 执行只留一行看不懂的
+        # 语法错误。既不像脚本也不像 shebang 开头的，按坏下载处理并清缓存（防重跑命中）。
+        if [[ $(head -c 1 "$inst" 2>/dev/null) == '<' ]]; then
+            rm -f "$inst" "$(fetch_cache_path 'https://sing-box.app/install.sh')"
+            die "sing-box 安装脚本内容异常（疑似下载到错误页），已清理缓存中止；请检查网络后重跑"
+        fi
         # 官方安装脚本失败时只留一行 ERR 陷阱看不清原因：捕获输出，失败时回显末尾
         # mktemp：/tmp 世界可写，$$ 可预测的固定名可被并发用户抢注（模板固定 POSIX /tmp）
         local inst_log; inst_log="$(mktemp "/tmp/.vps-init.sbinstall.XXXXXX.log")"
@@ -2782,8 +2818,13 @@ m_reality() {
             if [[ ! -d /root/.acme.sh ]]; then
                 local acme_inst="$CACHE_DIR/acme-install.sh"
                 if fetch_file "$acme_inst" https://get.acme.sh; then
-                    sh -s "email=${ACME_EMAIL}" < "$acme_inst" >/dev/null 2>&1 \
-                        || warn "acme.sh 安装脚本返回非 0（若已安装可忽略）"
+                    if [[ $(head -c 1 "$acme_inst" 2>/dev/null) == '<' ]]; then
+                        rm -f "$acme_inst" "$(fetch_cache_path 'https://get.acme.sh')"
+                        warn "acme.sh 安装脚本内容异常（疑似下载到错误页），已清理缓存并跳过执行，改用机器上已有的 acme.sh"
+                    else
+                        sh -s "email=${ACME_EMAIL}" < "$acme_inst" >/dev/null 2>&1 \
+                            || warn "acme.sh 安装脚本返回非 0（若已安装可忽略）"
+                    fi
                 else
                     warn "acme.sh 安装脚本下载失败，将尝试使用机器上已有的 acme.sh"
                 fi
@@ -2828,7 +2869,8 @@ m_reality() {
             cp -a /etc/caddy/Caddyfile /root/.vps-init.Caddyfile.bak 2>/dev/null || true
             info "已备份上一版 Caddyfile：/root/.vps-init.Caddyfile.bak（本次将按当前域名/端口覆盖）"
         fi
-        cat > /etc/caddy/Caddyfile <<EOF
+        # 写 .new 再原子替换：中途磁盘满/中断时旧 Caddyfile 仍在，caddy 不会吃到半截配置
+        cat > /etc/caddy/Caddyfile.new <<EOF
 {
     auto_https off
 }
@@ -2843,10 +2885,15 @@ EOF
         if [[ -n $WEB_PAGE && -f $WEB_PAGE ]]; then
             cp -f "$WEB_PAGE" "${WEB_ROOT}/index.html"
             ok "伪装站已使用自定义页面：${WEB_PAGE}"
-        elif write_bundled_web_page "${WEB_ROOT}/index.html"; then
-            ok "伪装站已使用内置页面（青山·一屏山色）"
         else
-            cat > "${WEB_ROOT}/index.html" <<'EOF'
+            # 指定了 --web-page 却找不到文件时静默退内置页，用户会以为自定义页已生效
+            if [[ -n $WEB_PAGE ]]; then
+                warn "--web-page 指定的文件不存在（${WEB_PAGE}），已改用内置页面"
+            fi
+            if write_bundled_web_page "${WEB_ROOT}/index.html"; then
+                ok "伪装站已使用内置页面（青山·一屏山色）"
+            else
+                cat > "${WEB_ROOT}/index.html" <<'EOF'
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -2864,21 +2911,31 @@ EOF
 <body><h1>It works</h1></body>
 </html>
 EOF
+            fi
         fi
         chown -R caddy:caddy "$WEB_ROOT" 2>/dev/null || true
-        caddy fmt --overwrite /etc/caddy/Caddyfile
-        caddy validate --config /etc/caddy/Caddyfile >/dev/null
+        caddy fmt --overwrite /etc/caddy/Caddyfile.new
+        caddy validate --config /etc/caddy/Caddyfile.new >/dev/null
+        mv -f /etc/caddy/Caddyfile.new /etc/caddy/Caddyfile
         systemctl enable --now caddy >/dev/null
         systemctl restart caddy
         sleep 1
+        # 自检失败仍继续（Caddy 可能只是启动慢或需放行端口），但最终就绪文案要跟着改口，
+        # 不能自检没过还报「已就绪」，用户据此去连才发现回落站根本没起。
+        local _fb_ok=1
         curl -ksS --max-time 8 --resolve "${DOMAIN}:${FALLBACK_PORT}:127.0.0.1" \
-            "https://${DOMAIN}:${FALLBACK_PORT}" >/dev/null && ok "回落站自检通过" || warn "回落站自检未通过，请检查 caddy 状态"
+            "https://${DOMAIN}:${FALLBACK_PORT}" >/dev/null && ok "回落站自检通过" \
+            || { warn "回落站自检未通过，请检查 caddy 状态"; _fb_ok=0; }
 
         if [[ -n ${CLI_SET[REALITY_SNI]:-} || -n ${CLI_SET[REALITY_DEST]:-} || -n ${CLI_SET[REALITY_DEST_PORT]:-} ]]; then
             warn "本地回落模式下 REALITY_SNI/DEST/DEST_PORT 由脚本按 ${DOMAIN}:${FALLBACK_PORT} 接管，忽略手工指定的值"
         fi
         REALITY_SNI="$DOMAIN"; REALITY_DEST="127.0.0.1"; REALITY_DEST_PORT="$FALLBACK_PORT"
-        ok "本地回落已就绪：${DOMAIN}:${FALLBACK_PORT}"
+        if [[ $_fb_ok -eq 1 ]]; then
+            ok "本地回落已就绪：${DOMAIN}:${FALLBACK_PORT}"
+        else
+            warn "本地回落已配置但自检未通过：${DOMAIN}:${FALLBACK_PORT}（请检查 caddy 状态后再交付客户端）"
+        fi
     else
         # 重跑降级：上次若走的是本地回落，state.env 里会残留 DEST=127.0.0.1 /
         # PORT=FALLBACK_PORT，而 ${VAR:-默认} 不会覆盖它。结果是握手指向一个
@@ -4096,11 +4153,11 @@ render_client_outbounds() {
 
 m_genconfig() {
     info "==> [8] 生成 sing-box 配置"
-    # 「沿用旧配置」：config.json 一个字节都不动 —— 不备份、不写 .new、不 mv、不重启服务。
+    # 「沿用旧配置」：config.json 一个字节都不动 —— 不备份、不写 .new、不 mv、不重启 sing-box。
     # 只做一次只读校验，把现有配置是否健康告诉用户。
     if [[ ${RERUN_MODE:-} == keep ]] && [[ -s $SB_CONF ]]; then
         if command -v sing-box >/dev/null 2>&1 && sing-box check -c "$SB_CONF" >/dev/null 2>&1; then
-            ok "沿用旧配置：${SB_CONF} 保持原样（未覆盖、未备份、未重启服务），现有凭据全部保留"
+            ok "沿用旧配置：${SB_CONF} 保持原样（未覆盖、未备份、未重启 sing-box），现有凭据全部保留"
         else
             warn "沿用旧配置：${SB_CONF} 无法校验或校验未通过；本次仍未改动任何文件，需要重建请选「生成新配置」"
         fi
@@ -4469,7 +4526,8 @@ m_summary() {
             && printf '  v6 节点策略：%s（--nat-v6-services）\n' \
                 "$([[ ${NAT_V6_SERVICES} == ssh-only ]] && echo '端口只供 SSH，不生成 v6 代理节点' || echo "仅保留 ${NAT_V6_SERVICES}")"
         printf '  用法：粘进客户端配置的 outbounds 数组；若客户端还没有 direct/block，请自行补上\n'
-        printf '  客户端版本：JSON 里 hy2 的 certificate_public_key_sha256 字段需较新 sing-box（≥ 1.13）；\n'
+        printf '  客户端版本：JSON 里 hy2 的 certificate_public_key_sha256 字段需 sing-box ≥ 1.13；\n'
+        printf '             启用端口跳跃时 hop_interval_max 字段需 ≥ 1.14（旧版严格校验未知字段会整份拒收）；\n'
         printf '             旧版客户端请改用上方分享链接（自带 pinSHA256 / insecure 校验信息）\n'
         printf '%s\n' "$outbounds_render"
         hr
@@ -5874,7 +5932,7 @@ CASES
     local link
     link="$(vless_link_for 0)"
     st_eq 'vless 主机加方括号'   '1' "$([[ $link == *"@[2001:db8::1]:443?"* ]] && echo 1 || echo 0)"
-    st_eq 'vless 节点名已编码'   '1' "$([[ $link == *'#东京%20%231'* ]] && echo 1 || echo 0)"
+    st_eq 'vless 节点名已编码（含非 ASCII UTF-8 字节）' '1' "$([[ $link == *'#%E4%B8%9C%E4%BA%AC%20%231'* ]] && echo 1 || echo 0)"
     link="$(hy2_link_for 0)"
     st_eq 'hy2 密码已百分号编码' '1' "$([[ $link == *'p%2Bq%2Fr%3Ds@'* ]] && echo 1 || echo 0)"
     st_eq 'hy2 无指纹降级 insecure' '1' "$([[ $link == *'&insecure=1'* ]] && echo 1 || echo 0)"

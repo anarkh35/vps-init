@@ -414,8 +414,8 @@ v4 / v6 节点、更不会把 selector 的 `default` 指向它。按推荐度排
 
 ```text
   1) 沿用旧配置  —— 完整保留现有 config.json、UUID、Reality 密钥、各密码、
-                     Hysteria2 自签证书与交付文件：不覆盖、不改动、不重启服务；
-                     已下发的客户端继续可用
+                     Hysteria2 自签证书与交付文件：不覆盖、不改动、不重启 sing-box；
+                     已下发的客户端继续可用；Caddyfile 等仍按所选模块维护
   2) 生成新配置  —— 每次都重新生成一整套新的 UUID / Reality 密钥 / short_id /
                      各密码 / 自签证书与 pinSHA256，并更新 config.json 与交付文件；
                      不复用固定值或上次生成结果；旧客户端全部作废
@@ -460,7 +460,7 @@ v4 / v6 节点、更不会把 selector 的 `default` 指向它。按推荐度排
 
 | 项目 | 沿用旧配置 | 生成新配置 |
 |---|---|---|
-| `/etc/sing-box/config.json` | 一个字节都不动；不备份、不写 `.new`、不 `mv`、不重启服务 | 时间戳备份 → 写 `.new` → `sing-box check` → 原子替换 → 重启 |
+| `/etc/sing-box/config.json` | 一个字节都不动；不备份、不写 `.new`、不 `mv`、不重启 sing-box | 时间戳备份 → 写 `.new` → `sing-box check` → 原子替换 → 重启 |
 | UUID / Reality 密钥 / short_id / 各密码 | 原样保留，模块 6 整段跳过 | 每次全换新；`--uuid` 固定值也被忽略，避免复用固定值 |
 | Hysteria2 自签证书 / pinSHA256 | 原样保留 | 每次重新签发 |
 | `state.env`、`vps-init.info`、`client-outbounds.json` | 凭据字段不改写，交付文件不重写 | 随新凭据重写，**必须重新导入客户端** |
@@ -557,7 +557,7 @@ bash vps-init.sh --print-outbounds    # 客户端 outbounds
 | `--cert-cn HOST` | Hysteria2 自签证书 CN / 客户端 `server_name`（默认 `bing.com`） |
 | `--uuid UUID` | 固定 UUID，**仅首次部署生效**。重跑选「沿用旧配置」时忽略（避免状态文件与 `config.json` 用两套凭据），选「生成新配置」时也忽略（不复用固定值） |
 | `--vless-port N` / `--hy2-port N` / `--fallback-port N` | 端口（默认 443 / 16407 / 8443） |
-| `--keep-config` | 重跑二选一之**沿用旧配置**：完整保留 `config.json` 与全部密码/密钥/证书，不覆盖、不改动、不重启服务 |
+| `--keep-config` | 重跑二选一之**沿用旧配置**：完整保留 `config.json` 与全部密码/密钥/证书，不覆盖、不改动、不重启 sing-box（Caddyfile / 伪装站等其它模块仍按所选模块正常维护） |
 | `--new-config` | 重跑二选一之**生成新配置**：每次重新生成全套凭据并更新 `config.json`，旧客户端全部作废 |
 | `--config-mode keep\|new` | 上面两个开关的带值写法；非法值直接报错退出。也可用环境变量 `RERUN_MODE=keep\|new` |
 | `--modules LIST` | 只执行指定模块，如 `1,2,3` |

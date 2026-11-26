@@ -46,7 +46,7 @@ v="$(vless_link_for 0)"; h="$(hy2_link_for 0)"
 echo "  vless : $v"
 echo "  hy2   : $h"
 chk "vless 主机加方括号" '1' "$([[ $v == *"@[2001:db8::1]:443?"* ]] && echo 1 || echo 0)"
-chk "vless 节点名已编码" '1' "$([[ $v == *'#东京%20%231%20v4-vl'* ]] && echo 1 || echo 0)"
+chk "vless 节点名已编码（含非 ASCII UTF-8 字节）" '1' "$([[ $v == *'#%E4%B8%9C%E4%BA%AC%20%231%20v4-vl'* ]] && echo 1 || echo 0)"
 chk "hy2 密码已编码"     '1' "$([[ $h == *'hysteria2://p%2Bq%2Fr%3Ds@[2001:db8::1]:16407/'* ]] && echo 1 || echo 0)"
 chk "hy2 无指纹走 insecure" '1' "$([[ $h == *'&insecure=1'* ]] && echo 1 || echo 0)"
 CERT_SHA256="252a35f2ee445063319242ea044c931559d60bdac7f8fd2e5669112b01a7c9dd"
@@ -1043,6 +1043,63 @@ chk "doctor NAT 分支的 v6 DNAT 检查也用 _nat6_ok 门控" '1' \
 # 回滚只删本次新建的文件，不误删用户手工预建的同名 keyring / 源
 chk "caddy 回滚只删本次新建的文件（有存在性标记）" '1' \
     "$( declare -f m_reality | grep -c '_caddy_repo_new -eq 1' )"
+
+# ---- T29 Round P 补丁：urlenc 非 ASCII / cert 大小写 / 形态校验 / 回落诚实文案 / keep 文案 / source 安全 ----
+echo "=========== T29 Round P 补丁 ==========="
+# 默认中文节点名会进分享链接 fragment：非 ASCII 必须按 UTF-8 字节百分号编码，
+# 否则链接裸奔 UTF-8 字节，部分客户端解析 fragment 会乱码/截断
+chk "urlenc 非 ASCII 按 UTF-8 逐字节百分号编码" '%E4%B8%AD%E6%96%87' "$(urlenc '中文')"
+chk "urlenc 混合 ASCII/非 ASCII" 'a%E4%B8%ADb%20c' "$(urlenc 'a中b c')"
+# DNS 不分大小写：证书 CN/SAN 与域名比对必须双侧小写归一，否则大写 CN 会被误判不匹配
+if command -v openssl >/dev/null 2>&1; then
+    _t29="$(mktemp -d 2>/dev/null || true)"
+    if [[ -n $_t29 ]] && openssl req -x509 -newkey rsa:2048 -nodes \
+            -keyout "${_t29}/k.pem" -out "${_t29}/c.pem" \
+            -subj '/CN=Node1.Example.COM' -days 1 \
+            -addext 'subjectAltName=DNS:Node1.Example.COM' >/dev/null 2>&1; then
+        chk "证书 CN 大写、域名小写仍匹配" '0' \
+            "$(cert_domain_matches "${_t29}/c.pem" node1.example.com && echo 0 || echo 1)"
+        chk "证书域名大写查询仍匹配" '0' \
+            "$(cert_domain_matches "${_t29}/c.pem" NODE1.EXAMPLE.COM && echo 0 || echo 1)"
+    else
+        echo "SKIP  本机 openssl 无法生成临时证书，跳过证书大小写用例"
+    fi
+    [[ -n $_t29 ]] && rm -rf "$_t29" 2>/dev/null || true
+else
+    echo "SKIP  无 openssl，跳过证书大小写用例"
+fi
+# 下载形态校验：CDN 错误页（HTML）混进 install.sh 直接 sh 执行只留一行难懂语法错
+chk "m_singbox 执行 install.sh 前拒收 HTML 形态" '1' \
+    "$( declare -f m_singbox | grep -c 'head -c 1 "$inst"' )"
+chk "m_singbox 形态校验失败同步清缓存副本" '1' \
+    "$( declare -f m_singbox | grep -c "fetch_cache_path 'https://sing-box.app/install.sh'" )"
+chk "m_reality 执行 acme install 前拒收 HTML 形态" '1' \
+    "$( declare -f m_reality | grep -c 'head -c 1 "$acme_inst"' )"
+chk "m_reality acme 形态校验失败同步清缓存副本" '1' \
+    "$( declare -f m_reality | grep -c "fetch_cache_path 'https://get.acme.sh'" )"
+# --web-page 指定文件缺失时必须告警，不能静默退内置页（用户以为自定义页已生效）
+chk "web-page 缺失时告警而非静默换内置页" '1' \
+    "$( declare -f m_reality | grep -c '已改用内置页面' )"
+# 回落自检失败不得谎报「已就绪」
+chk "回落自检失败文案如实改口" '1' \
+    "$( declare -f m_reality | grep -c '已配置但自检未通过' )"
+# Caddyfile 原子写：先写 .new、fmt+validate 通过再替换，中断不留半截配置
+chk "Caddyfile 先写 .new 再原子替换" '1' \
+    "$( declare -f m_reality | grep -c 'mv -f /etc/caddy/Caddyfile.new' )"
+# keep 承诺精确到 sing-box：模块 7 仍会维护 Caddyfile / 重启 caddy，不得笼统写「不重启服务」
+chk "keep 文案精确到「不重启 sing-box」" '4' \
+    "$( grep -c '不重启 sing-box' "$SELF/../vps-init.sh" )"
+chk "keep 文案不再笼统写「不重启服务」" '0' \
+    "$( grep -c '不重启服务' "$SELF/../vps-init.sh" )"
+# hop_interval_max 需 ≥1.14（严格未知字段检查会整份拒收客户端 JSON），版本注记必须写明
+chk "客户端版本注记写明 hop_interval_max 版本要求" '1' \
+    "$( grep -c 'hop_interval_max 字段需' "$SELF/../vps-init.sh" )"
+# 被 source 载入时不得吃掉调用方位置参数（shift 会毁调用方 $@、未知参数分支会 exit 调用方）
+chk "source 载入不消耗调用方位置参数" '2' \
+    "$( bash -c 'set -- a b; source "$1" >/dev/null 2>&1; echo $#' _ "$SELF/../vps-init.sh" )"
+# 解析抽成 parse_cli_args：探针（verify.sh）source 后显式调用，语义与直接执行一致
+chk "parse_cli_args 显式调用可解析命令行" '1234' \
+    "$( bash -c 'source "$1" >/dev/null 2>&1; parse_cli_args --ssh-port 1234 >/dev/null 2>&1; echo $SSH_PORT' _ "$SELF/../vps-init.sh" )"
 
 echo
 echo "================================================"

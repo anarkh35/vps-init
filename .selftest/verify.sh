@@ -43,7 +43,9 @@ gen_copy > "$T/probe.sh"         # 仅供 source 的副本
 
 cat > "$T/probe-run.sh" <<'PROBE'
 #!/usr/bin/env bash
-source "$(dirname "$0")/probe.sh"   # 顺带把 $@ 交给它的参数解析
+source "$(dirname "$0")/probe.sh"
+# 解析显式调用（source 时不再顶层解析、$@ 属于本探针）：命令行 > 状态文件 > 默认值
+parse_cli_args "$@"
 load_state
 printf 'EFF:SSH_PORT=%s;HY2_PORT=%s;VLESS_PORT=%s;HOP_RANGE=%s;TZ_NAME=%s;NODE_NAME=%s\n' \
     "$SSH_PORT" "$HY2_PORT" "$VLESS_PORT" "$HOP_RANGE" "$TZ_NAME" "$NODE_NAME"
