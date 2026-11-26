@@ -37,16 +37,22 @@ else
 fi
 
 if [[ -f .selftest/all.sh ]]; then
-    if ! bash .selftest/all.sh; then
+    # 一次跑、两次判：全量回归要十几分钟，此前第二遍只为了 grep「层跳过」标记，
+    # 白白把提交门槛拖到 ~35 分钟。tee 留日志，rc 与 SKIP 标记都从同一份输出判。
+    _pc_log="$(mktemp "${TMPDIR:-/tmp}/.vps-init.precommit.XXXXXX")"
+    if ! bash .selftest/all.sh 2>&1 | tee "$_pc_log"; then
         echo "[pre-commit] ✗ 六层自检未通过，已拒绝提交"
+        rm -f "$_pc_log"
         exit 1
     fi
     # all.sh 退出码 0 但整层跳过（缺 python 时 renders/crlf 记 SKIP）也视为未通过：
     # "没崩"不等于"断言真的跑过"，提交门槛不能被假绿绕过
-    if bash .selftest/all.sh 2>/dev/null | grep -q '层跳过'; then
+    if grep -q '层跳过' "$_pc_log"; then
         echo "[pre-commit] ✗ 自检存在跳过的层（缺依赖），已拒绝提交"
+        rm -f "$_pc_log"
         exit 1
     fi
+    rm -f "$_pc_log"
 else
     echo "[pre-commit] 提示：未找到 .selftest/all.sh，跳过桩测试"
 fi

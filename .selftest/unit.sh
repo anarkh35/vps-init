@@ -1014,6 +1014,36 @@ chk "cmd_doctor 不再仅凭 ip6tables 命令存在就要求 v6 DNAT" '0' \
 chk "cmd_doctor 捕获 _nat6 查询成功标志" '1' \
     "$( declare -f cmd_doctor | grep -c '_nat6_ok=1' )"
 
+# ---- T27 Round O：裸 -- 防崩 / apt 显式守卫 / pre-commit 单遍 / 轮换文案 ----
+# 裸 -- 是选项结束符：mark_cli 的 --*) 分支会把 `${opt#--}` 变成空串，
+# CLI_SET[""]=1 在 bash 里是 bad array subscript（脚本直接崩）。
+chk "mark_cli 对裸 -- 不产生空下标" '0' \
+    "$( declare -A CLI_SET=(); mark_cli -- 2>/dev/null; [[ ${#CLI_SET[@]} -eq 0 ]] && echo 0 || echo 1 )"
+chk "裸 -- 被吞掉且后续选项照常生效" '0' \
+    "$( bash "$SELF/../vps-init.sh" -- --help >/dev/null 2>&1; echo $? )"
+chk "apt-get update 有显式 die 守卫（条件上下文吞 errexit）" '1' \
+    "$( declare -f apt_update | grep -c 'apt-get update -qq || die' )"
+# pre-commit 钩子曾跑两遍全量回归（第二遍只为 grep「层跳过」），单遍即可
+chk "pre-commit 只调用一次 all.sh" '1' \
+    "$( grep -c 'bash \.selftest/all\.sh' "$SELF/../.githooks/pre-commit" )"
+# --rotate-secrets 不动 Reality 密钥与自签证书，摘要文案不得写成「重新生成全套」
+chk "轮换模式有专属凭据文案（Reality 密钥/证书不变）" '1' \
+    "$( grep -c '仅轮换 UUID / short_id / hy2 密码 / obfs 密码' "$SELF/../vps-init.sh" )"
+
+# ---- T28 Round O 补丁：形状校验清缓存副本 / NAT 分支 v6 门控 / 回滚只删新建文件 ----
+# 校验失败只删目标文件不够：fetch_file 还把内容存进了 fetch_cache_path 副本，
+# 重跑先命中坏缓存 → 校验再失败 → 死循环卡死在同一步。
+chk "caddy 公钥形状校验失败同时清理缓存副本" '1' \
+    "$( declare -f m_reality | grep -c "fetch_cache_path 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key'" )"
+chk "caddy 源形状校验失败同时清理缓存副本" '1' \
+    "$( declare -f m_reality | grep -c "fetch_cache_path 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt'" )"
+# NAT_ACTIVE 分支此前漏了 _nat6_ok 门控（Round N 只改了非 NAT 分支）
+chk "doctor NAT 分支的 v6 DNAT 检查也用 _nat6_ok 门控" '1' \
+    "$( declare -f cmd_doctor | grep -c 'NAT_V6_OPEN:-0} -eq 1 && \$_nat6_ok -eq 1' )"
+# 回滚只删本次新建的文件，不误删用户手工预建的同名 keyring / 源
+chk "caddy 回滚只删本次新建的文件（有存在性标记）" '1' \
+    "$( declare -f m_reality | grep -c '_caddy_repo_new -eq 1' )"
+
 echo
 echo "================================================"
 printf '通过 %d 项，失败 %d 项\n' "$pass" "$fail"

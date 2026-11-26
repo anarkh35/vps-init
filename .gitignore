@@ -25,6 +25,11 @@
 .selftest/gen.counter
 # unit.sh T21 的分域名状态沙箱（正常自删，中途失败会残留）
 .selftest/state-domain*
+.selftest/state-srv-keep*
+.selftest/state-caddy*
+# unit.sh rotate_old_baks / renders.sh 损坏状态测试的临时沙箱（失败时残留）
+.selftest/rot/
+.selftest/state-bad*
 # verify.sh 有状态 iptables 记账桩的规则文件（B 段运行时生成/清空）
 .selftest/ipt-rules*.txt
 # 六层回归的完整证据日志 —— 每次跑 all.sh 重新生成，只留在本地作证据，不入库

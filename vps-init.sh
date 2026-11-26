@@ -402,7 +402,9 @@ apt_update() {
         info "检测到 dpkg 中断残留，执行 dpkg --configure -a 修复"
         dpkg --configure -a || warn "dpkg --configure -a 未完全成功，后续安装可能失败，请查看上方输出"
     fi
-    apt-get update -qq
+    # 显式守卫：在 `if ! ( ... )` 条件上下文里 errexit 与 ERR trap 都被忽略，
+    # 裸命令失败会被吞掉（还会错误地置 APT_UPDATED=1）。更新失败必须当场 die。
+    apt-get update -qq || die "apt-get update 失败，软件源不可用，请检查网络 / apt 源后重跑"
     APT_UPDATED=1
 }
 # 安装失败时回显输出，避免只留一个行号
@@ -1229,6 +1231,7 @@ mark_cli() {
         --manage-only|--no-manage-only) key="MANAGE_ONLY";;
         --sb-bandwidth) CLI_SET[SB_UP_MBPS]=1; CLI_SET[SB_DOWN_MBPS]=1; return 0;;
         --tcp-keep-alive-int) key="TCP_KEEP_ALIVE_INTERVAL";;
+        --)             return 0;;   # 选项结束符：无位置参数可收，主解析里也直接丢弃
         --*)            key="${opt#--}"; key="${key//-/_}"; key="${key^^}";;
         *)              return 0;;
     esac
@@ -1237,6 +1240,9 @@ mark_cli() {
 }
 
 while [[ $# -gt 0 ]]; do
+    # 裸 -- 是选项结束符：本脚本无位置参数，直接吞掉而不是抛「未知参数」或
+    # 让 mark_cli 拿空下标写 CLI_SET（bash 报 bad array subscript，脚本崩）
+    if [[ $1 == -- ]]; then shift; continue; fi
     mark_cli "$1"
     case "$1" in
         --ssh-port) need_val "$@"; need_port "--ssh-port" "$2"; SSH_PORT="$2"; shift 2;;
@@ -1723,7 +1729,11 @@ choose_rerun_mode() {
     # 已通过命令行 / 环境变量明确选择
     if [[ -n $RERUN_MODE ]]; then
         if [[ $RERUN_MODE == new ]]; then
-            info "本次重跑方式：生成新配置 —— 全套密码/密钥重新生成，config.json 与交付文件将更新"
+            if [[ ${ROTATE_SECRETS:-0} -eq 1 ]]; then
+                info "本次重跑方式：快速换钥匙 —— 仅轮换 UUID / short_id / hy2 密码 / obfs 密码（Reality 密钥与自签证书不变）"
+            else
+                info "本次重跑方式：生成新配置 —— 全套密码/密钥重新生成，config.json 与交付文件将更新"
+            fi
         else
             info "本次重跑方式：沿用旧配置 —— config.json 与全部密码/密钥保持原样，不做任何覆盖"
         fi
@@ -1788,7 +1798,11 @@ report_rerun() {
         printf '  配置文件  : %s 与交付文件保持原样，不覆盖、不改动、不重启服务\n' "$SB_CONF"
         printf '  已下发客户端继续可用；想换一套全新凭据请显式加 --new-config\n'
     elif [[ ${MOD_ON[5]:-0} -eq 1 ]]; then
-        printf '  凭据      : 本次重新生成 UUID / Reality 密钥 / short_id / 各密码 / 自签证书（不复用上次结果）\n'
+        if [[ ${ROTATE_SECRETS:-0} -eq 1 ]]; then
+            printf '  凭据      : 本次轮换 UUID / short_id / hy2 密码 / obfs 密码（Reality 密钥与自签证书保持不变，pinSHA256 无需更新）\n'
+        else
+            printf '  凭据      : 本次重新生成 UUID / Reality 密钥 / short_id / 各密码 / 自签证书（不复用上次结果）\n'
+        fi
         printf '  ! 重要    : 旧客户端配置与分享链接全部失效，请重新导入 /root/vps-init.info 与 client-outbounds.json\n'
     else
         printf '  凭据      : 本次不含模块 6，沿用现有凭据（UUID %s…）；要换凭据请加 --modules 6\n' "${UUID:0:8}"
@@ -2718,19 +2732,25 @@ m_reality() {
             fetch_file "$caddy_key" 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
                 || die "caddy 仓库公钥下载失败，无法添加 apt 源"
             # 内容形状校验：CDN/代理故障时可能返回 HTML 错误页，一旦被写进 keyring /
-            # sources.list.d，后续每次 apt 操作都会被坏源污染。校验失败顺带清掉缓存，
-            # 否则下次重跑会命中同一份坏缓存、永远卡死在同一步。
+            # sources.list.d，后续每次 apt 操作都会被坏源污染。校验失败必须**同时**清掉
+            # 目标文件与 fetch_cache_path 的缓存副本 —— fetch_file 会把下载内容另存一份
+            # 缓存，重跑时先命中缓存、形状校验又失败，就永远卡死在同一步。
             if ! grep -q 'BEGIN PGP PUBLIC KEY BLOCK' "$caddy_key" 2>/dev/null; then
-                rm -f "$caddy_key"
+                rm -f "$caddy_key" "$(fetch_cache_path 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key')"
                 die "caddy 仓库公钥内容异常（不含 GPG 公钥块，疑似下载到了错误页），已清理缓存中止；请检查网络后重跑"
             fi
             fetch_file "$caddy_repo" 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
                 || die "caddy 仓库地址下载失败，无法添加 apt 源"
             if ! grep -qE '^[[:space:]]*deb ' "$caddy_repo" 2>/dev/null; then
-                rm -f "$caddy_repo"
+                rm -f "$caddy_repo" "$(fetch_cache_path 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt')"
                 die "caddy 仓库地址内容异常（不含 deb 源行，疑似下载到了错误页），已清理缓存中止；请检查网络后重跑"
             fi
             mkdir -p /usr/share/keyrings /etc/apt/sources.list.d
+            # 回滚只删「本次写入的」文件：两个目标路径是 Caddy 官方命名，用户可能手工
+            # 预建过（也配了自己的源），回滚连带删掉会误伤用户资产。
+            local _caddy_key_new=0 _caddy_repo_new=0
+            [[ -e /usr/share/keyrings/caddy-stable-archive-keyring.gpg ]] || _caddy_key_new=1
+            [[ -e /etc/apt/sources.list.d/caddy-stable.list ]] || _caddy_repo_new=1
             # --batch --yes：keyring 已存在时（上次在本步之后失败）gpg 会交互询问覆盖，
             # 而 stdin 已被重定向为 key 文件 —— 非交互下必然报错，重跑永远过不去
             gpg --batch --yes --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg < "$caddy_key"
@@ -2743,8 +2763,8 @@ m_reality() {
             # 安装失败时回滚新增源与公钥：apt_install 会 die，用子壳捕获，
             # 留半成品源在 sources.list.d 里会让后续每次 apt 操作都报错
             if ! ( apt_install caddy ); then
-                rm -f /etc/apt/sources.list.d/caddy-stable.list \
-                    /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+                [[ $_caddy_repo_new -eq 1 ]] && rm -f /etc/apt/sources.list.d/caddy-stable.list
+                [[ $_caddy_key_new -eq 1 ]] && rm -f /usr/share/keyrings/caddy-stable-archive-keyring.gpg
                 die "caddy 安装失败，已回滚新增的 apt 源与公钥（避免坏源污染后续 apt 操作）"
             fi
         fi
@@ -4854,7 +4874,7 @@ cmd_doctor() {
         if [[ -n $HOP_RANGE ]]; then
             if [[ ${NAT_ACTIVE:-0} -eq 1 ]]; then
                 [[ ${NAT_V4_OPEN:-0} -eq 1 ]] && _doct_hop_v4=1   # 受限族没有整段 DNAT，不作要求
-                [[ ${NAT_V6_OPEN:-0} -eq 1 ]] && _doct_hop_v6=1
+                [[ ${NAT_V6_OPEN:-0} -eq 1 && $_nat6_ok -eq 1 ]] && _doct_hop_v6=1
             else
                 _doct_hop_v4=1
                 [[ $_nat6_ok -eq 1 ]] && _doct_hop_v6=1

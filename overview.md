@@ -452,6 +452,9 @@ v4 / v6 节点、更不会把 selector 的 `default` 指向它。按推荐度排
 - **实例互斥**：写路径（部署 / `--rotate-secrets` / `--uninstall`）运行期间会在
   `~/.vps-init/.instance.lock` 上加 `flock` 独占锁，第二个实例会直接拒绝启动；
   只读命令（`--status` / `--doctor` / `--print-*`）不取锁。
+- **状态目录**：`state.env` 与锁文件默认在 `/root/.vps-init/`，可用环境变量
+  `STATE_DIR` 整体改到别的目录（主要给测试 / 多实例隔离用，普通部署无需关心）；
+  下载缓存固定在 `/var/cache/vps-init/`，不受 `STATE_DIR` 影响。
 
 **两种模式的实际行为**
 
